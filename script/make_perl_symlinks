@@ -30,6 +30,8 @@ die bold . text_red . "$links_directory does not exist!" . reset . "\n"
 cleanup_dead_symlinks( $links_directory );
 my @perls_directories = get_perl_directories();
 
+make_latest( $perls_directories[-1][0] );
+done( "Made latest symlinks for @{[ join '.', $perls_directories[-1][1]->@* ]} in $links_directory" );
 # say dumper(\@perls_directories);
 
 my $count = 0;
@@ -37,7 +39,7 @@ DIRECTORY: foreach my $tuple ( @perls_directories ) {
 	clear();
 	next unless -e $tuple->[0];
 	$count += make_links( $tuple->[0], join('.', $tuple->[1]->@*) );
-	done( dirname dirname $tuple->[0] );
+	done( "Made symlinks for " . dirname dirname $tuple->[0] );
 	}
 done( "Made $count symlinks in $links_directory" );
 
@@ -139,15 +141,13 @@ sub make_links ( $perl_path, $version_string, $links_dir = $links_directory ) {
 	return $count;
 	}
 
-sub make_latest ( $latest ) {
-	my( $dir, $version ) = ( $latest->[0], "$latest->[1]" );
-
-	foreach my $bin ( glob( catfile( $dir, 'bin', '*' ) ) ) {
+sub make_latest ( $latest_perl_path ) {
+	foreach my $bin ( glob catfile( dirname($latest_perl_path), '*' ) ) {
 		my $basename = basename( $bin );
 		$basename =~ s/5\.\d+\.\d+\z//;
 
-		my $link = catfile( $links_directory, $basename );
-		progress( sprintf "%s linking %s => %s", '   ', $bin, $link );
+		my $link = catfile( $links_directory, "$basename-latest" );
+		progress_overwrite( sprintf "%s linking %s for latest", '   ', $bin );
 		if( -e $link ) {
 			unlink $link or problem( "Could not unlink <$link>: $!" );
 			}
