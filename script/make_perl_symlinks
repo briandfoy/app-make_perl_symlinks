@@ -1,56 +1,99 @@
 #!/Users/brian/bin/perl
 use 5.034;
 use utf8;
+use open qw(:std :utf8);
 use warnings;
 use experimental qw(signatures);
 
+use Antsy                 qw(:all);
 use File::Basename;
 use File::Spec::Functions qw(rel2abs catfile);
-use File::Path qw(make_path);
+use File::Path            qw(make_path);
+use List::Util            qw(max);
 use Perl::Version;
-use Antsy qw(:all);
+use Term::ReadKey         qw(GetTerminalSize);
 
-use constant CHECKMARK => bold . text_green . "\x{2714}" . reset;
-use constant CROSS     => bold . text_red . "\x{274C}" . reset;
+use constant CHECKMARK => bold . text_green . "\x{2705}" . reset;
+use constant CROSS     => bold . text_red   . "\x{274C}" . reset;
+use constant COLUMNS   => (GetTerminalSize)[0];
+use constant ROWS      => (GetTerminalSize)[1];
 
-say <<~"HERE";
-CHECK: @{[CHECKMARK]}
-CROSS: @{[CROSS]}
-HERE
+sub am_debugging () { !! $ENV{'DEBUG'} }
+sub debug    ($message) { _message( "[debug] $message" ) }
+unless( am_debugging ) { no warnings qw(redefine); *debug = sub { 1 } }
 
-exit;
 my $links_directory = $ARGV[1] // catfile( $ENV{HOME}, 'bin', 'perls' );
 make_path $links_directory;
-die colored( ['red'], "$links_directory does not exist!" ) . "\n"
+die bold . text_red . "$links_directory does not exist!" . reset . "\n"
 	unless -d $links_directory;
 
-
 cleanup_dead_symlinks( $links_directory );
+my @perls_directories = get_perl_directories();
+
+# say dumper(\@perls_directories);
+
+my $count = 0;
+DIRECTORY: foreach my $tuple ( @perls_directories ) {
+	clear();
+	next unless -e $tuple->[0];
+	$count += make_links( $tuple->[0], join('.', $tuple->[1]->@*) );
+	done( dirname dirname $tuple->[0] );
+	}
+done( "Made $count symlinks in $links_directory" );
 
 sub cleanup_dead_symlinks ( $dir ) {
-	my @dead_links =
-		grep { defined readlink($_) }
+	progress_overwrite("Cleaning up dead links");
+	my @problem_links =
+		map {
+			say "Unlinking dead link <$_>";
+			unlink ? () : do {
+				warn "Could not remove <$_>: $!\n";
+				$_;
+				};
+			}
+		grep { ! -e readlink }
 		grep { -l }
 		map { rel2abs( $_, $dir ) }
-		glob( '*' );
+		glob( catfile $dir, '*' );
 
-	foreach my $link ( @dead_links ) {
+	@problem_links == 0
+		?
+	done("Cleaned up dead links")
+		:
+	problem("There were leftover dead links")
+	;
 
-		my $rc = unlink $link;
-
-		}
-	unlink @dead_links;
 	}
 
-sub get_perl ( $dir ) {
-	cleanup_source_dir( $dir );
-	unless( -e catfile( $dir, 'bin' ) ) {
-		say colored( ['magenta'], "\tNo bin/ directory in <$dir>. Skipping!" );
-		return;
-		}
+sub dumper { state $rc = require Data::Dumper; Data::Dumper->new([@_])->Indent(1)->Sortkeys(1)->Terse(1)->Useqq(1)->Dump }
 
-	my @perls = glob( catfile( $dir, qw( bin perl5* ) ) );
-	$perls[0];
+sub get_perl_directories ( $base = '/usr/local/perls' ) {
+	my @perls_directories =
+		sort {
+			$a->[1][1] <=> $b->[1][1]
+				or
+			$a->[1][2] <=> $b->[1][2]
+			}
+		map {
+			[ $_, get_perl_version($_)]
+			}
+		grep { -e }
+		map {
+			catfile $_, qw(bin perl)
+			}
+		glob( catfile $base, '*' );
+	}
+
+sub get_perl_version ($path) {
+	my $output = `$path -v`;
+	return do {
+		if( $output =~ /v (5) \. (\d+) \. (\d+) /xa ) {
+			[ @{^CAPTURE} ];
+			}
+		else {
+			[];
+			}
+		};
 	}
 
 sub cleanup_source_dir ( $dir ) {
@@ -63,30 +106,19 @@ sub cleanup_source_dir ( $dir ) {
 
 	foreach my $t ( @tuples ) {
 		next unless( -e $t->[0] and !(-e $t->[1]) );
-		warn "Symlinking <$t->[0]> to <$t->[1]>";
+		debug( "Symlinking <$t->[0]> to <$t->[1]>" );
 		symlink $t->[0], $t->[1];
 		}
 
 	$vperl;
 	}
 
-sub get_version ( $perl_path ) {
-	my $hash;
+sub make_links ( $perl_path, $version_string, $links_dir = $links_directory ) {
+	my @bins = glob( catfile( dirname($perl_path), '*' ) );
 
-	say "perl path is: $perl_path";
-
-	( $hash->{path_version} ) = $perl_path =~ m/(5\.\d+\.\d+)\z/;
-	$hash->{full}       = Perl::Version->new( $hash->{path_version} );
-	$hash->{rc}         = $perl_path =~ /RC/i;
-	$hash->{devel}      = $hash->{full}->version % 2;
-	$hash->{version}    = join '.', $hash->{full}->revision, $hash->{full}->version;
-	$hash->{subversion} = $hash->{full}->subversion;
-
-	return $hash;
-	}
-
-sub make_links ( $dir, $version_string, $links_dir = $links_directory ) {
-	foreach my $bin ( glob( catfile( $dir, 'bin', '*' ) ) ) {
+	my $count = 0;
+	foreach my $bin ( @bins ) {
+		debug( "\tlooking at $bin" );
 		my $link_basename = do {
 			my $basename = basename( $bin );
 			if( $basename =~ m/5\.\d+\.\d+\z/) { $basename }
@@ -94,15 +126,17 @@ sub make_links ( $dir, $version_string, $links_dir = $links_directory ) {
 			};
 
 		my $link = catfile( $links_directory, $link_basename );
-		say colored( ['green'], "    linking $bin => $link" );
-		next;
+		next if( -l $link and $bin eq readlink $link );
+		$count++;
+		progress_overwrite( sprintf "%s linking %s", '   ', $bin );
 
 		unless( -e $link ) {
 			symlink $bin => $link or
-				warn colored( ['red'], "    Could not create bin symlink [$!]: $bin => $link!" )  . "\n";
+				problem( "  Could not create bin symlink [$!]: $bin => $link!" );
 			}
-
 		}
+
+	return $count;
 	}
 
 sub make_latest ( $latest ) {
@@ -113,45 +147,31 @@ sub make_latest ( $latest ) {
 		$basename =~ s/5\.\d+\.\d+\z//;
 
 		my $link = catfile( $links_directory, $basename );
-		say colored( ['green'], "    linking $bin => $link" );
+		progress( sprintf "%s linking %s => %s", '   ', $bin, $link );
 		if( -e $link ) {
-			warn "Link <$link> exists\n";
-			unlink $link or warn colored( ['red'], "Could not unlink <$link>: $!" ) . "\n";
+			unlink $link or problem( "Could not unlink <$link>: $!" );
 			}
-		warn "Link <$link> still exists\n" if -e $link;
 		symlink $bin, $link or
-			warn colored( ['red'], "\t\t\tCould not create latest symlink [$!]: <$bin> => <$link>!" )  . "\n";
+			problem( "Could not create latest symlink [$!]: <$bin> => <$link>!" );
 		}
 	}
 
-my $perls_glob        = catfile( $ARGV[0] // '/usr/local/perls', 'perl*' );
-my @perls_directories = glob( $perls_glob );
+sub clear () { print +(' ' x COLUMNS) . "\r" }
 
-my $latest = [ undef, [qw(0 0 0)], undef ];
-DIRECTORY: foreach my $directory ( @perls_directories ) {
-	say colored( ['green'], "=== Processing $directory" );
+sub _message ($message, $ansi = [], $fh = \*STDOUT) {
+	$message =~ s/ (?[ [\s] - [\r] ])* \z//x;
+	print { $fh } $ansi->@*, $message, reset, $message =~ m/\v/ ? '' : "\n";
+	}
 
-	my $perl = get_perl( $directory );
-	next unless $perl;
+sub done     ($message) { clear(); _message( CHECKMARK . '  ' . $message,                    ) }
+sub header   ($message) { _message(                    $message, [bold, text_cyan]  ) }
+sub problem  ($message) { _message( CROSS . '  ' .     $message, [bold, text_red]   ) }
+sub progress ($message) { _message( '  ' .             $message, [bold, text_green] ) }
 
-	my @this_parts = split /\./, basename($perl) =~ s/[^0-9.]//rg;
-	my $can_be_latest = ( $perl !~ m/RC/ || ($this_parts[1] % 2) == 1 );
-
-	my $is_latest  = (
-		$this_parts[1] > $latest->[1][1]
-			or
-		($this_parts[1] == $latest->[1][1] and $this_parts[2] > $latest->[1][2])
-		);
-
-	if( $is_latest ) {
-		#say colored( ['yellow'], sprintf "\t%s is later than %s", join('.',@this_parts), join('.',$latest->[1]->@*) );
-		$latest->[0] = $directory;
-		$latest->[1] = \@this_parts if $is_latest;
-		$latest->[2] = $perl;
-		}
-
-	make_links( $directory, join('.',@this_parts) );
-	make_latest( $latest );
+sub progress_overwrite ($message) {
+	state $separator = am_debugging ? "\n" : "\r";
+	_message( (' ' x ROWS) . "\r" ) unless am_debugging;
+	_message( '  ' .             $message . $separator, [bold, text_green] );
 	}
 
 __END__
