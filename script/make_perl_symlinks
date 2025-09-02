@@ -6,6 +6,7 @@ use open qw(:std :utf8);
 
 our $VERSION = '1.004';
 
+# some of this stuff isn't on CPAN.
 use lib qw(/Users/brian/Dev/bmt/lib /Users/brian/Dev/ghojo/lib);
 use App::bmt;
 
