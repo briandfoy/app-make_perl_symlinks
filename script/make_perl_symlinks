@@ -38,10 +38,6 @@ use constant EX_ERROR            => 1;
 use constant EX_USAGE            => 2;
 use constant EX_COMMAND_DISABLED => 4;
 
-=item * debug
-
-=cut
-
 sub debug ($message) { say STDERR text_cyan() . $message . reset() if am_debugging() }
 sub am_debugging () { $ENV{BMT_DEBUG} }
 
@@ -53,6 +49,8 @@ sub url     ($url)     { text_bright_magenta() . $url . reset() }
 sub command ($command) { chomp($command); bg_bright_blue() . text_black() . $command . reset() . $/; }
 
 sub subheader ($message) { chomp($message); bg_bright_cyan() . text_black() . $message . reset() . $/; }
+
+=encoding utf8
 
 =head1 NAME
 
@@ -1957,6 +1955,8 @@ sub zenodo :Register("Open the Zenodo page") {
 	return _browser( _zenodo_page() )
 	}
 
+=back
+
 =head2 Mostly internal functions
 
 =over 4
@@ -2447,7 +2447,7 @@ Open a URL in Safari
 
 sub _open_darwin :Trace ( $url ) { system 'open', '-a', 'Safari', $url }
 
-=item _orc_id
+=item * _orc_id
 
 =cut
 
@@ -2567,7 +2567,7 @@ sub _version {
 	my $version = Module::Extract::VERSION->parse_version_safely( $version_from );
 	}
 
-=itme * _zenodo_page
+=item * _zenodo_page
 
 Construct the Zenodo page URL from the repo owner and name
 
