@@ -68,18 +68,10 @@ my %WriteMakefile = (
 
 	'PREREQ_PM' => {
 		'Antsy'                 => '0',
-		'B'                     => '0',
-		'Carp'                  => '0',
-		'Cpanel::JSON::XS'      => '0',
-		'Cwd'                   => '0',
 		'File::Basename'        => '0',
 		'File::Path'            => '0',
 		'File::Spec::Functions' => '0',
-		'Module::CoreList'      => '0',
-		'Mojo::JSON'            => '0',
-		'Mojo::UserAgent'       => '0',
-		'Mojo::Util'            => '0',
-		'Time::HiRes'           => '0',
+		'Perl::Version'         => '0',
 		},
 
 	'META_MERGE' => {
