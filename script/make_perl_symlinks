@@ -12,27 +12,22 @@ use App::bmt;
 
 package App::bmt;
 
-use experimental qw(builtin);
-use builtin qw(trim);
+use experimental           qw(builtin);
+use builtin                qw(trim);
+use experimental           qw(signatures);
 
-
-use experimental qw(signatures);
+use Antsy                  qw(:all);
 use B;
-
-use Cwd qw(getcwd);
+use Cpanel::JSON::XS       qw();
+use Cwd                    qw(getcwd);
 use File::Basename;
-use File::Path qw(make_path);
+use File::Path             qw(make_path);
 use File::Spec::Functions;
 use Module::CoreList;
-
-use Antsy qw(:all);
-use Cpanel::JSON::XS ();
-use Mojo::JSON qw(decode_json encode_json);
+use Mojo::JSON             qw(decode_json encode_json);
 use Mojo::UserAgent;
-use Mojo::Util qw(decode dumper);
-use Time::HiRes qw(gettimeofday tv_interval);
-
-my %Commands;
+use Mojo::Util             qw(decode dumper);
+use Time::HiRes            qw(gettimeofday tv_interval);
 
 use constant EX_SUCCESS          => 0;
 use constant EX_ERROR            => 1;
@@ -115,6 +110,8 @@ doing anything:
 	}
 
 =cut
+
+my %Commands;
 
 sub MODIFY_CODE_ATTRIBUTES ( $package, $code_ref, @attributes ) {
 	my( $sub_name ) = B::svref_2object( $code_ref )->GV->NAME;
