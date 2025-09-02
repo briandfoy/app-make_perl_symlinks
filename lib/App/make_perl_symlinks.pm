@@ -14,35 +14,15 @@ App::make_perl_symlinks - Make version-specific sublinks to perl tools
 
 =head1 SYNOPSIS
 
-	use App::make_perl_symlinks;
+This is a placeholder package for the B<make_perl_symlinks> utility.
 
 =head1 DESCRIPTION
 
-=over 4
-
-=item new
-
-=cut
-
-sub new {
-
-	}
-
-=item init
-
-=cut
-
-sub init {
-
-	}
-
-=back
+This is a placeholder package for the B<make_perl_symlinks> utility.
 
 =head1 TO DO
 
-
 =head1 SEE ALSO
-
 
 =head1 SOURCE AVAILABILITY
 
