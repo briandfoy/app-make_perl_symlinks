@@ -1,0 +1,2642 @@
+#!/Users/brian/bin/perl
+use utf8;
+use v5.36;
+use warnings;
+use open qw(:std :utf8);
+
+our $VERSION = '1.004';
+
+use lib qw(/Users/brian/Dev/bmt/lib /Users/brian/Dev/ghojo/lib);
+use App::bmt;
+
+package App::bmt;
+
+use experimental qw(builtin);
+use builtin qw(trim);
+
+
+use experimental qw(signatures);
+use B;
+
+use Cwd qw(getcwd);
+use File::Basename;
+use File::Path qw(make_path);
+use File::Spec::Functions;
+use Module::CoreList;
+
+use Antsy qw(:all);
+use Cpanel::JSON::XS ();
+use Mojo::JSON qw(decode_json encode_json);
+use Mojo::UserAgent;
+use Mojo::Util qw(decode dumper);
+use Time::HiRes qw(gettimeofday tv_interval);
+
+my %Commands;
+
+use constant EX_SUCCESS          => 0;
+use constant EX_ERROR            => 1;
+use constant EX_USAGE            => 2;
+use constant EX_COMMAND_DISABLED => 4;
+
+=item * debug
+
+=cut
+
+sub debug ($message) { say STDERR text_cyan() . $message . reset() if am_debugging() }
+sub am_debugging () { $ENV{BMT_DEBUG} }
+
+sub info    ($message) { $message }
+sub success ($message) { text_green() . $message . reset() }
+sub error   ($message) { text_red()   . $message . reset() }
+sub file    ($file)    { text_bright_green()   . $file . reset() }
+sub url     ($url)     { text_bright_magenta() . $url . reset() }
+sub command ($command) { chomp($command); bg_bright_blue() . text_black() . $command . reset() . $/; }
+
+sub subheader ($message) { chomp($message); bg_bright_cyan() . text_black() . $message . reset() . $/; }
+
+=head1 NAME
+
+bmt - brian's module tool
+
+=head1 SYNOPSIS
+
+	% bmt COMMAND
+
+To see the commands:
+
+	% bmt
+	% bmt help
+
+To get command completion
+
+	% bmt complete
+
+=head1 DESCRIPTION
+
+I use this to manage my work in Perl modules. It's very particular to
+how I do things. I change it frequently as I figure out how to do things
+better. I don't support anything earlier than the latest commit.
+
+First, my F<Makefile.PL>'s are modulinos. They construct their argument
+lists to C<WriteMakefile> but don't actually do anything unless it's
+called as a program. Load it like a module and I can get that argument list
+without the program doing its work. I can then inspect that data structure.
+
+Second, the modulino uses the package name of the main module and return
+that package name. As such, when I C<require './Makefile'>, I get back
+a package name. I can use that to call methods in the modulino so I can
+access any info I need.
+
+=head2 Configuration
+
+B<bmt> looks at F<~/.bmt> and F<./.bmt> for JSON structures that
+represent the config. The structures in these two files are combined,
+with F<./.bmt> shadowing values in F<~/.bmt>:
+
+In the per-user file F<~/.bmt> are things that most likely apply to
+every repo:
+
+	{
+	"github_user": "briandfoy",
+	"gitlab_user": "briandfoy",
+	"bitbucket_user": "briandfoy",
+	"cpan_user": "bdfoy"
+	}
+
+In the repo file F<./.bmt> are settings for the local repo. So far,
+that's the C<disabled> object to block certain commands. The key
+is the command and the value is the reason it is blocked. When you try
+to run this command, B<bmt> will catch it and exit with 4 without
+doing anything:
+
+	{
+	"disabled": {
+			"update_workflows": "Task modules don't have the usual workflow"
+			}
+	}
+
+=cut
+
+sub MODIFY_CODE_ATTRIBUTES ( $package, $code_ref, @attributes ) {
+	my( $sub_name ) = B::svref_2object( $code_ref )->GV->NAME;
+
+	my @bad_attributes = ();
+	foreach my $attribute ( @attributes ) {
+		my( $attribute_name ) = map { uc() } $attribute =~ m/\A(\w+)/;
+		no strict 'refs';
+		if( exists &{"ATTRIBUTE_$attribute_name"} ) {
+			push @bad_attributes, $attribute if &{"ATTRIBUTE_$attribute_name"}( $package, $code_ref, $attribute )
+			}
+		else { push @bad_attributes, $attribute }
+		}
+
+	@bad_attributes;
+	}
+
+sub ATTRIBUTE_TRACE ( $package, $code_ref, $attribute ) {
+	return unless $ENV{BMT_TRACE};
+
+	my( $sub_name ) = B::svref_2object( $code_ref )->GV->NAME;
+
+	no strict 'refs';
+
+	*{"$sub_name"} = sub ( @args ) {
+		my @caller = caller(1);
+		debug( "Entering <$sub_name>" );
+		my @return;
+		if( wantarray ) {
+			push @return, $code_ref->( @args );
+			}
+		else {
+			push @return, scalar $code_ref->( @args );
+			}
+
+		debug("Leaving <$sub_name>");
+		return wantarray ? @return : $return[0];
+		};
+
+	return;
+	}
+
+sub ATTRIBUTE_REGISTER ( $package, $code_ref, $attribute ) {
+	my( $sub_name )    = B::svref_2object( $code_ref )->GV->NAME;
+	my( $description ) = $attribute =~ m/ \A Register \( \s* " ([^"]+) " \s* \) /ix;
+
+	$Commands{ $sub_name } = [ $code_ref, $description ];
+
+	return;
+	}
+
+my %Config;
+
+run( @ARGV ) unless caller;
+
+sub _disabled( $command ) { eval { $Config{disabled}{$command} } };
+
+sub run ( @args ) {
+	my( $command, @cmd_args ) = @args;
+	$command //= 'help';
+
+	foreach my $config_file ( catfile( $ENV{HOME}, '.bmt' ), '.bmt' ) {
+		next unless -e $config_file;
+		state $rc = require Mojo::File;
+		state $rc2 = require Mojo::JSON;
+		my %this = Mojo::JSON::decode_json( Mojo::File->new( $config_file )->slurp )->%*;
+		%Config = ( %Config, %this ); # yuck, but quick
+		}
+
+	if( my $message = _disabled( $command ) ) {
+		say STDERR error( "Command <$command> is disabled for this repo:\n\t$message" );
+		exit EX_COMMAND_DISABLED;
+		}
+	elsif( exists $Commands{$command} ) {
+		my $output = $Commands{$command}->[0]( @cmd_args );
+		say info( $output ) unless 0 == ( length($output) // 0 );
+		}
+	else {
+		state $rc = require Text::Fuzzy;
+		my $tf = Text::Fuzzy->new($command);
+		my $nearest = $tf->nearestv( [ keys %Commands ] );
+		say STDERR error( "Command <$command> wasn't found; perhaps you meant <$nearest>?\nSee `$0 help`" );
+		exit EX_USAGE;
+		}
+	}
+
+=head2 Commands
+
+=over 4
+
+=item * actions
+
+Open the GitHub actions page.
+
+=cut
+
+sub actions :Register("open the actions Github page") :Trace { _browser( _github_page('actions') ) }
+
+=item * adjust_appveyor
+
+Adjust the AppVeyor config for the minimum Perl configuration. The
+Ubuntu1804 image has v5.26 and the Ubuntu2004 image has v5.30. So far
+there isn't a Ubuntu2204, but that will have v5.34.
+
+This removes the images that we can't use.
+
+=cut
+
+sub _appveyor_file { '.appveyor.yml' }
+sub adjust_appveyor :Register("adjust AppVeyor config for min Perl versions") {
+	state $rc = require YAML::XS;
+
+	my $arguments = _settings();
+	my $min = substr( $arguments->{MIN_PERL_VERSION}, 0, 5 );
+	return unless $min gt '5.026';
+
+	my $target = _appveyor_file();
+	my $data = do { local( @ARGV, $/ ) = ($target); <> };
+	$data =~ s/^\h+Ubuntu1804\h*\R// if $min gt '5.026';
+	$data =~ s/^\h+Ubuntu2004\h*\R// if $min gt '5.030';
+	$data =~ s/^\h+Ubuntu2204\h*\R// if $min gt '5.034';
+
+	open my $fh, '>:encoding(UTF-8)', $target;
+	print { $fh } $data;
+	close $fh;
+
+	return "";
+	}
+
+=item * adjust_linux_workflow
+
+Adjust the GitHub linux workflow:
+
+	* Remove Perl versions that should not be there based on the minimum Perl version
+
+=cut
+
+sub _cron_line {
+	my $module = _main_module();
+
+	my $weekday = int rand 7;
+	my $hour    = int rand 24;
+	my $minute  = int rand 60;
+
+	# cron: "37 3 * * 0"
+	"$minute $hour * * $weekday";
+	}
+
+sub _linux_workflow { '.github/workflows/linux.yml' }
+sub adjust_linux_workflow :Register("adjust linux workflow perl versions") ( %args ) {
+	state $rc = require YAML::XS;
+	my $target = _linux_workflow();
+	return "" unless -e $target;
+	my $yaml = YAML::XS::LoadFile( $target );
+
+	my $arguments = _settings();
+	my $min_version = $arguments->{MIN_PERL_VERSION};
+	$min_version = '5.014' if $min_version eq '5.014001';
+	$min_version = '5.008' if $min_version eq '5.008005';
+	my $min_version_s = $min_version =~ s/5\.\K0+//r;
+	$min_version_s = '5.08' if $min_version eq '5.008';
+	debug( "\tmin version: $min_version -> $min_version_s" );
+
+	my @versions = $yaml->{jobs}{perl}{strategy}{matrix}{'perl-version'}->@*;
+
+	my @should_remove = grep { my $s = $_; $s =~ s/-.*//; $s < $min_version_s } grep { /\A5/ } @versions;
+	my @five_point_eights = grep { /\A5\.8/ } @versions;
+	unshift @should_remove, @five_point_eights unless $min_version eq '5.008';
+
+	say info( "\tfound versions: @versions" );
+	say info( "\tshould remove: @should_remove" );
+	#return unless @should_remove;
+
+	my $alternation = join '|', @should_remove;
+	$alternation =~ s/\./\\./g;
+	my $regex = qr/^\h+-\h+'($alternation)'\R/m;
+
+	my $data = do { local( @ARGV, $/ ) = ($target); <> };
+
+	my $subs = $data =~ s/$regex//g;
+
+	if( $args{cron} ) {
+		my $cron_line = _cron_line();
+
+		$data =~ s/^ \s+ - \s+ cron: \s+ \K .+ /"$cron_line"/xm and
+			say info( "Cron line updates to $cron_line" );
+		}
+
+	open my $fh, '>:encoding(UTF-8)', $target;
+	print { $fh } $data;
+	close $fh;
+
+	return "";
+	}
+
+=item * all_remote
+
+I like to have my repos stored on multiple services so I can tolerate
+the failure of a couple of them. So far I use Github as the primary
+and Bitbucket and Gitlab as the backups.
+
+There's a curious thing you can do with a remote: it can take multiple
+push urls. Use Github as the fetch URL, but push to all the services
+through one remote. Since I don't mess with Bitbucket or Gitlab, those
+should never be out of sync. And, it they are, I just delete the repo
+and start again with a fresh push.
+
+This bit of code took me awhile to simplify to the point where it
+could work. The goal is to collect all the URLs I need to push to.
+
+First, there has to be an origin. I'd like to fix that at some point,
+but that's how it is now. That's Github.
+
+Second, there might already be remotes for Bitbucket and Gitlab. If
+there are, grab their URLs. If there aren't, make them. The trick is
+to guess what the URLs should be since I have several owners on Github
+(counting organizations) but only single personal accounts on the
+other services.
+
+Then, if there isn't a remote named 'all', make that with Github
+address. Grab all those URLs from the other remotes and add those as
+pushurls if all doesn't already have them.
+
+=cut
+
+sub all_remote :Register("configure the all remote") ( @args ) {
+	state $all_remote = 'all';
+	my $url = _git_fetch_url( 'origin' ) // _git_fetch_url( $all_remote );
+
+	unless( $url ) {
+		say STDERR error( "No URL for origin or all. Aborting..." );
+		return;
+		}
+
+	my %hosts = (
+		bitbucket => 'git@bitbucket.org',
+		codeberg  => 'git@codeberg.org',
+		gitlab    => 'git@gitlab.com',
+		github    => 'git@github.com',
+		);
+
+	my %remotes;
+	foreach my $remote ( keys %hosts ) {
+		$remotes{$remote} = do {
+			if( _remote_exists( $remote ) ) { _capture_command( "git config remote.$remote.url" ) }
+			else {
+				no strict 'refs';
+				my $user = &{"_${remote}_user"}();
+				my $push_url = $url =~ s|git\@github.com:(?:\S+?)/(\S+?)\.git$|$hosts{$remote}:$user/$1.git|r;
+				_run_git_command( 'remote', 'add', $remote, $push_url );
+				$push_url
+				}
+			};
+		}
+
+	unless( _remote_exists( $all_remote ) ) {
+		_run_git_command( 'remote', 'add', $all_remote, $url ),
+		}
+
+	# these already exist, so don't re-add them
+	my @push_urls = map { chomp; $_ } split /\R/, _capture_command( "git config --get-all remote.$all_remote.pushurl" );
+	debug Mojo::Util::dumper(\@push_urls);
+	my %push_urls_count;
+	foreach my $url ( @push_urls ) {
+		$push_urls_count{$url}++;
+		}
+	debug Mojo::Util::dumper(\%push_urls_count);
+
+	foreach my $url ( keys %push_urls_count ) {
+		next if $push_urls_count{$url} < 2;
+		# this will delete all the entries that use $url, so we have to
+		# re-add it
+		_run_git_command( 'remote', 'set-url', '--delete', '--push', $all_remote, $url );
+		_git_set_push_url( $all_remote, $url );
+		}
+
+	foreach my $url ( grep { defined } values %remotes ) {
+		next if exists $push_urls_count{$url};
+		debug "Removing duplicated url $url from $all_remote remote";
+		_git_set_push_url( $all_remote, $url );
+		}
+
+	_run_git_command( 'push', '-u', $all_remote, 'master' );
+
+	return "Adding $all_remote remote";
+	}
+
+=item * appveyor
+
+Open the main Appveyor page for this repo.
+
+=cut
+
+sub appveyor :Register("open the Appveyor page") {
+	state %Colors = (
+		success   => 'bg_green',
+		failure   => 'bg_red', # has this changed?
+		failed    => 'bg_red',
+		'default' => 'bg_cyan',
+		);
+
+	my $account = _appveyor_account();
+	my $repo = ( _github_owner_repo() )[-1];
+
+	state $url = sprintf "https://ci.appveyor.com/api/projects/%s/%s", $account, $repo;
+
+	require Mojo::UserAgent;
+	my $ua = Mojo::UserAgent->new;
+
+	my $tx = $ua->get(
+		$url =>
+		{ Authorization => "Bearer " . _appveyor_api_key() }
+		);
+
+	my $data = $tx->res->json;
+
+	my @jobs = grep defined, eval { $data->{build}{jobs}->@* };
+
+	if( @jobs == 0 ) {
+		return "There were no AppVeyor jobs";
+		}
+
+	my $string = join( "\n", $data->{build}->@{ qw(commitId message) } ) . "\n";
+	foreach my $job ( @jobs ) {
+		my $name = $job->{name} =~ s/\AImage:\s+//r;
+		my $status = do { no strict 'refs'; &{ $Colors{$job->{status} || 'default'} } . $job->{status} . reset() };
+		$string .= sprintf "%s: %s\n", $name, $status;
+		}
+
+	return $string;
+	}
+
+=item * appveyor_page
+
+Open the main Appveyor page for this repo.
+
+=cut
+
+sub appveyor_page :Register("open the Appveyor page") { _browser( _appveyor_page() ) }
+
+=item * arguments
+
+=cut
+
+sub arguments :Register("Show the arguments for WriteMakefile") {
+	dumper( _settings() );
+	}
+
+=item * bitbucket
+
+Open the main Bitbucket page for this repo.
+
+=cut
+
+sub bitbucket :Register("open the main Bitbucket page") { _browser( _bitbucket_page() ) }
+
+=item * bump
+
+=cut
+
+sub _next_version ( $module_version ) {
+	$module_version = sprintf "%.3f", $module_version;
+	my $increment = $module_version =~ /9\z/ ? 0.002 : 0.001;
+
+	$module_version += $increment;
+	}
+
+sub bump :Register("bump the version if needed") {
+	my( undef, $cpan_version ) = _cpan_version();
+	my $module_version = modulev();
+
+	if( $cpan_version < $module_version ) {
+		return "module version is higher than CPAN version already";
+		}
+
+	my %changed_before = map { chomp; $_ => 1 } `git diff --name-only`;
+	if( keys %changed_before ) {
+		return "repo is dirty. stopping.";
+		}
+
+	say info( "CPAN and local module versions are both $cpan_version" );
+	my $next_version = _next_version( $module_version );
+
+	say info( "Next version => $next_version" );
+
+	my @output = `ppi_version $module_version $next_version`;
+	my %changed_after = map { chomp; $_ => 1 } `git diff --name-only`;
+
+	my @new = grep { ! exists $changed_before{$_} } keys %changed_after;
+	say info( join "\n\t", "Changed modules:", @new );
+
+	my $message = "bump version from $cpan_version to $next_version";
+	_run_git_command( 'commit', '-a', '-m', $message );
+
+	return 'version updated';
+	}
+
+=item * cff
+
+Create or update a CITATION.cff file.
+
+https://github.com/citation-file-format/citation-file-format/blob/main/README.md
+
+=cut
+
+sub cff :Register("create or update the CITATION.cff file") {
+	state $filename = 'CITATION.cff';
+	state $rc = require YAML::XS;
+
+	state %licenses = qw(
+		artistic2 Artistic-2.0
+		);
+
+	my $settings = _settings();
+
+	my $data = do {
+		-e $filename ? YAML::XS::LoadFile($filename) : {}
+		};
+
+	$data->{'cff-version'}     = '1.2.0';
+
+	($data->{'license'})       = grep {
+		defined
+		} ( $licenses{$settings->{LICENSE}}, $settings->{LICENSE} );
+	$data->{'repository-code'} = $settings->{META_MERGE}{resources}{homepage};
+	$data->{'date-released'}   = _latest_release_date();
+	$data->{'abstract'}        = _abstract_from();
+	$data->{'title'}           = sprintf "The %s Perl module", _main_module();
+	$data->{'version'}         = '' . _latest_release_version();
+
+	$data->{"license-url"}    = "$settings->{META_MERGE}{resources}{homepage}/blob/master/LICENSE";
+
+	$data->{"type"} //= 'software';
+
+# repository-artifact
+
+	$data->{'authors'}         //= [ {
+		"family-names" => 'foy',
+		"given-names"  => 'brian d',
+		"orcid"        => _orc_id(),
+		"email"        => 'briandfoy@pobox.com',
+		"alias"        => "briandfoy"
+		}
+		];
+
+	$data->{message} //= 'The GitHub page for this module provides formatted citations';
+
+	my $yaml = YAML::XS::Dump($data);
+
+	my $header_comment = <<~"HERE";
+		# This CITATION.cff file was generated with $0
+		# @{[scalar localtime]}
+
+		HERE
+
+	$yaml =~ s/\A---\R/$header_comment/;
+	$yaml =~ s/\R+\z/\n/;
+	open my $fh, '>:encoding(UTF-8)', $filename or die "Could not open <$filename>: $!";
+	say {$fh} $yaml;
+	close $fh;
+
+	my $test_dir = 'xt';
+	my $test_file = catfile( $test_dir, 'citation.t' );
+	unless( -e $test_file ) {
+		make_path $test_dir unless -d $test_dir;
+
+		open my $fh, '>:encoding(UTF-8)', $test_file;
+		say {$fh} <<~"HERE";
+			# This $test_file file was generated with $0
+			# @{[scalar localtime]}
+
+			HERE
+
+		say {$fh} <<~'HERE';
+			use strict;
+
+			use Test::More;
+
+			my $file = 'CITATION.cff';
+
+			SKIP: {
+					my $rc = eval { require YAML; YAML->VERSION('1.26'); 1 };
+					skip "Need YAML to test $file", 1 unless $rc;
+
+					subtest citations => sub {
+							ok( -e $file, "$file exists" );
+							my $data = eval { YAML::LoadFile( $file ) };
+							my $error = $@;
+							ok( defined $data, "Loaded data from $file" ) or diag( "Error loading $file: $@" );
+							};
+					}
+
+			done_testing();
+			HERE
+		}
+
+	return "Created $filename";
+	}
+
+=item * complete [FILE]
+
+Output a complete(1) command to FILE, or to F<~/.bmt-complete> if there is
+no file specified.
+
+=cut
+
+sub complete :Register("output a completion script for complete") ( $file = '~/.bmt-complete' ) {
+	# https://iridakos.com/programming/2018/03/01/bash-programmable-completion-tutorial
+
+	my $fh;
+
+	$file =~ s|\A~/?|$ENV{HOME}/|;
+
+	if( $file eq '-' ) {
+		$fh = \*STDOUT;
+		}
+	else {
+		open $fh, '>:encoding(UTF-8)', $file
+			or die "Could not open <$file> for writing: $!\n";
+		}
+
+	print {$fh} <<~"HERE";
+		#/usr/bin/env bash
+		complete -W "@{ [ sort keys %Commands ]}" bmt
+		HERE
+	close $fh;
+
+	return <<~"HERE" unless $file eq '-';
+		# Add this to your .bash_profile:
+
+		BMT_COMPLETE=$file
+		if [ -f "\$BMT_COMPLETE" ]; then
+			source \$BMT_COMPLETE
+		fi
+		HERE
+	}
+
+=item * cpan_testers
+
+Output the latest CPAN Testers results for this module.
+
+=cut
+
+sub _by_os ( $string ) {
+	local $_ = $string;
+	   if( /(free|open)bsd/n ) { 'bsd' }
+	elsif( /linux/   ) { 'linux'   }
+	elsif( /solaris/ ) { 'solaris' }
+	elsif( /darwin/  ) { 'darwin'  }
+	else               { $_ }
+	};
+
+sub _by_version( $string ) {
+	sprintf '%d.%03d', split /\./, $string =~ s/\A 5 \. \d+ \K .*//xr;
+	};
+
+sub _cpan_testers_classify_matrix ( $data ) {
+	my $matrix = {};
+	foreach my $entry ( $data->@* ) {
+		my $platform = _by_os( $entry->{platform} );
+		$matrix->{$platform}{ _by_version($entry->{perl}) }{ $entry->{grade} }++
+		}
+	return $matrix;
+	}
+
+sub _cpan_testers_json ( $release = undef ) {
+	$release //= _latest_release_version();
+	my $dist_name = _dist_name();
+	my $url = sprintf 'http://api.cpantesters.org/v3/summary/%s/%s', $dist_name, $release;
+
+	my $data = _ua()->get( $url )->result->json;
+	return [] unless ref $data eq ref [];
+	return $data;
+	}
+
+sub cpan_testers :Register("show Testers result for the latest version") ( $release = undef ) {
+	my $data = _cpan_testers_json($release);
+
+	say info( _dist_name() . ' ' . ( $release // _latest_release_version() ) );
+
+	my $results = _classify( 'grade', $data );
+	printf "%s / %s / %s\n",
+		text_green() . (sprintf '%3s', $results->{pass} // '-') . reset(),
+		text_red()   . (sprintf '%3s', $results->{fail} // '-') . reset(),
+		text_cyan()  . (sprintf '%3s', $results->{na}   // '-') . reset();
+
+	my @records;
+	foreach my $entry ( $data->@* ) {
+		state $rc = print "\n";
+		next unless $entry->{grade} eq 'fail';
+
+		push @records, [
+			text_red()  . 'fail' . reset(),
+			_by_os($entry->{platform}),
+			_by_version($entry->{perl}),
+			sprintf('https://www.cpantesters.org/report/%s', $entry->{guid})
+			];
+		}
+
+	@records = sort {
+		$a->[1] cmp $b->[1]
+		  or
+		$a->[2] cmp $b->[2]
+		} @records;
+
+	foreach my $entry ( @records ) {
+		printf "%s %-10s %5s   %s\n", $entry->@*
+		}
+	}
+
+sub cpan_testers_matrix :Register("show Testers results as a matrix") ( $release = undef ) {
+	my $data = _cpan_testers_json($release);
+
+	my $matrix = _cpan_testers_classify_matrix( $data );
+
+	say encode_json( $matrix );
+	}
+
+=item * cpanv
+
+Output the latest CPAN version and release date.
+
+=cut
+
+sub _cpan_version () {
+	my $module = _metacpan()->module( _main_module() );
+
+	my $date    = $module->{data}{date};
+	my $version = $module->{data}{version};
+
+	( $date, $version );
+	}
+
+sub cpanv :Register("show the lastest CPAN version") ( @args ) {
+	my( $date, $version ) = _cpan_version();
+
+	return "CPAN: @{[_main_module()]} $version ---> $date";
+	}
+
+=item * create_bb
+
+Create the Bitbucket repo. This does not push the repo.
+
+=item * create_codeberg
+
+Create the Codeberg repo. This does not push to the repo.
+
+=item * create_gh
+
+Create the GitHub repo. This does not push the repo.
+
+=item * create_gl
+
+Create the Gitlab repo. This does not push the repo.
+
+=cut
+
+sub create_bb :Register("create a BitBucket repo") { create_bitbucket() }
+sub create_cb :Register("create a Codeberg repo")  { create_codeberg()  }
+sub create_gh :Register("create a GitHub repo")    { create_github()    }
+sub create_gl :Register("create a GitLab repo")    { create_gitlab()    }
+
+sub create_bitbucket ( @args ) {
+	my $ua = _ua();
+
+	my( $owner, $repo_name ) = _github_owner_repo();
+
+	my $user = _bitbucket_user();
+	my $adjusted_repo = lc($repo_name) =~ s/[:-]+/-/gr;
+	my $url = sprintf 'https://%s:%s@api.bitbucket.org/2.0/repositories/%s/%s',
+		$user, _bitbucket_app_password(),
+		$user, $adjusted_repo;
+
+	my $default_bitbucket_project = 'PROJ';
+
+	my $tx = $ua->post(
+		$url,
+		{ 'Content-type' => 'application/json' },
+		json => { project => { key => $default_bitbucket_project } }
+		);
+
+	return do {
+		if( $tx->result->is_success ) { "Created Bitbucket repo <$user/$adjusted_repo>" }
+		else { "Could not create Bitbucket repo\n" . $tx->req->to_string . "\n" . $tx->res->to_string }
+		};
+	}
+
+sub create_codeberg ( @args ) {
+	my $ua = _ua();
+
+	my( $owner, $repo_name ) = _github_owner_repo();
+	my $token = $ENV{CODEBERG_API_TOKEN};
+
+	my $tx = $ua->post(
+		'https://codeberg.org/api/v1/user/repos',
+		{
+			'Content-type'  => 'application/json',
+			'Authorization' => "token $token",
+		},
+		json => { name => $repo_name, default_branch => 'master' }
+		);
+
+	return do {
+		if( $tx->result->is_success ) { "Created Codeberg repo <$repo_name>" }
+		elsif( $tx->result->code eq '409' ) { "Codeberg repo already exists" }
+		else { "Could not create Codeberg repo\n" . $tx->res->to_string }
+		};
+	}
+
+sub create_github ( $description = 'An undescribed module' ) {
+	my $ghojo = _ghojo();
+
+	my( $owner, $repo ) = _github_owner_repo();
+
+	my $rc = $ghojo->create_repo( { name => $repo, description => $description } );
+
+	if( $rc->is_success ) {
+		return "Created repo <$repo>";
+		}
+	else {
+		die "Counld not create repo <$repo>: " . dumper($rc);
+		}
+	}
+
+sub create_gitlab ( @args ) {
+# https://docs.gitlab.com/ee/api/projects.html#create-project-for-user
+	my $ua = _ua();
+
+	my( $owner, $repo_name ) = _github_owner_repo();
+
+	my $token = $ENV{BMT_GITLAB_TOKEN};
+	my $tx = $ua->post(
+		'https://gitlab.com/api/v4/projects',
+		{
+			'Content-type'  => 'application/json',
+			'Authorization' => "Bearer $token",
+		},
+		json => { name => $repo_name, visibility => 'public' }
+		);
+
+	return do {
+		if( $tx->result->is_success ) { "Created Gitlab repo <$repo_name>" }
+		else { "Could not create Bitbucket repo\n" . $tx->req->to_string . "\n" . $tx->res->to_string }
+		};
+	}
+
+=item * create_repos
+
+Create the GitHub, BitBucket, and Gitlab repos.
+
+=cut
+
+sub create_repos :Register("create GitHub, Bitbucket, and Gitlab in one go") ( $repo_name, $description ) {
+	create_github( $description );
+	my $remote = sprintf 'git@github.com:%s/%s.git', _github_user(), $repo_name;
+	_run_git_command( 'remote', 'add', 'all', $remote );
+
+	create_bitbucket();
+	create_codeberg();
+	create_gitlab();
+
+	all_remote();
+	}
+
+=item * deps
+
+Output the dependency chain.
+
+=cut
+
+sub deps :Register("show the dependency chain for this dist") {
+	my @queue = ( [ 0, _dist_name()] );
+	my $mcpan = _metacpan();
+
+	my $Seen = {};
+
+	while( my $next = shift @queue ) {
+		my $suffix = exists $Seen->{ $next->[1] } ?  ' <already seen>' : '';
+		say info( join '', "\t" x $next->[0], $next->[1], $suffix );
+		next if $suffix;
+		$Seen->{ $next->[1] }++;
+
+		unshift @queue,
+			map  { [ $next->[0] + 1, $_ ] }
+			grep { defined }
+			map  { _module_to_dist( $_ ) }
+			grep { ! Module::CoreList::is_core( $_ ) and $_ ne 'perl' }
+			sort
+			map  { $_->{module} }
+			grep { $_->{relationship} eq 'requires' }
+			grep { $_->{phase} eq 'runtime' }
+			map  { $_->@* }
+			eval { $mcpan->release( $next->[1] )->{data}{dependency} } // [];
+		}
+
+	say info( "Dependency count: " . keys $Seen->%* );
+	my $string = join " ", sort keys $Seen->%*;
+	$string =~ s/.{50,70}\K\s/\n/g;
+	return $string;
+	}
+
+=item * downstreams
+
+=cut
+
+sub downstreams :Register("discover and track downstream users") {
+	state $downstream_file = '.downstream.json';
+	if( ! -e $downstream_file or 0 == -s $downstream_file ) {
+		open my $fh, '>:utf8', $downstream_file;
+		print {$fh} <<~'JSON';
+			{
+			"meta": {},
+			"downstreams": []
+			}
+			JSON
+		}
+
+	my $raw = Mojo::File->new($downstream_file)->slurp;
+	my $perl = decode_json($raw);
+
+	my %hash = map {
+		$_->{dist} => $_;
+		} $perl->{downstreams}->@*;
+
+	my $command = "cpan-dependents " . _main_module();
+	my @dist_names = `$command`;
+	chomp(@dist_names);
+
+	foreach my $dist_name ( @dist_names ) {
+		say info( "Examining $dist_name" );
+		my $dist_meta = _metacpan()->release($dist_name);
+
+		my $item = do {
+			if( exists $hash{$dist_name} ) { $hash{$dist_name} }
+			else {
+				say info( "\tadding new downstream entry for $dist_name" );
+				my $new_item = {};
+				push $perl->{downstreams}->@*, $new_item;
+				$new_item;
+				}
+			};
+
+		my @table = (
+			[ 'dist',               $dist_name ],
+			[ 'active',             \1 ],
+			[ 'do_not_contanct',    \0 ],
+			[ 'email',              undef ],
+			[ 'primary_maintainer', $dist_meta->{data}{author} ],
+			[ 'repo',               ( $dist_meta->{data}{metadata}{resources}{url} // $dist_meta->{data}{metadata}{resources}{url} ), ],
+			[ 'main_module',        $dist_meta->{data}{main_module}, ],
+			[ 'metacpan',           "https://metacpan.org/pod/$item->{main_module}" ],
+			[ 'ignore',             $item->{dist} =~ m/\A(Bundle|Task)-/n ? \1 : \0 ],
+			);
+
+		foreach my $row ( @table ) {
+			my( $field, $default ) = $row->@*;
+
+			unless( exists $item->{$field} ) {
+				say info( "\tadding field $field" );
+				}
+			unless( defined $item->{$field} ) {
+				next unless defined $default;
+				my $setting = do {
+					if( ref $default && ref $default eq ref \1 ) {
+						$$default ? '<true>' : '<false>';
+						}
+					else { undef }
+					};
+				next unless defined $setting;
+				say info( "\tupdating $field to $setting" );
+				$item->{$field} //= $default;
+				}
+			}
+
+		}
+
+	open my $fh, '>:encoding(UTF-8)', $downstream_file;
+	print {$fh} JSON::PP->new->pretty->encode($perl);
+	close $fh;
+
+	join "\n\t", "Downstream CPAN modules are", sort @dist_names;
+	}
+
+=item * dump_dist
+
+Output as JSON the distribution information from MetaCPAN.
+
+	$ bmt dump_dist | jq -r .download_url
+	https://cpan.metacpan.org/authors/id/B/BD/BDFOY/Tie-Cycle-1.226.tar.gz
+
+=cut
+
+sub dump_dist :Register("output JSON for the MetaCPAN distribution info") {
+	state $rc = require Mojo::JSON;
+	return Mojo::JSON::encode_json( _metacpan()->release( _dist_name() )->{data} );
+	}
+
+=item * dump_module
+
+Output as JSON the module information from MetaCPAN.
+
+	$ bmt dump_module | jq -r .version
+	1.226
+
+=cut
+
+sub dump_module :Register("output JSON for the MetaCPAN module info") () {
+	state $rc = require Mojo::JSON;
+	return Mojo::JSON::encode_json( _metacpan()->module( _main_module() )->{data} )
+	}
+
+sub dump_settings :Register("output Makefile.PL settings as JSON" ) {
+	state $rc = require Mojo::JSON;
+	return Mojo::JSON::encode_json( _settings() )
+	}
+
+=item * edit
+
+Open B<bmt> in an editor. I'm always adjusting this tool.
+
+This looks in BMT_EDITOR, then EDITOR. The default editor is B<bbedit>.
+My tool, my editor :)
+
+=cut
+
+sub edit :Register("open bmt in a BMT_EDITOR or EDITOR") ( @args ) {
+	system $ENV{BMT_EDITOR} // $ENV{EDITOR} // 'bbedit', __FILE__;
+	return '';
+	}
+
+=item * gh_name
+
+Output the GitHub repository name ("owner/repo")
+
+	$ bmt gh_name
+	briandfoy/tie-cycle
+
+=cut
+
+sub gh_name :Register("show the full_name of the Github repo") ( @args ) {
+	return join '/', _github_owner_repo();
+	}
+
+=item * github
+
+Open the GitHub main page for this repo.
+
+=cut
+
+sub github :Register("open the main Github page") { _browser( _github_page() ) }
+
+=item * github_labels
+
+Create the basic labels for GitHub issues.
+
+=cut
+
+# https://medium.com/@dave_lunny/sane-github-labels-c5d2e6004b63
+
+sub _labels_set {
+	state %type_labels = (
+		_meta => {
+			prefix => 'Type',
+			},
+		'enhancement'             => ['5F00FF', 'improve a feature that already exists'],
+		'feature request'         => ['5F00FF', 'add a feature that does not exist'],
+		'modernization'           => ['5F00FF', 'code is updated for latest practices'],
+		'bug'                     => ['FF0000', 'an existing feature does not work'],
+		'test bug'                => ['FF0000', 'an existing test is broken'],
+		'test failure'            => ['FF0000', 'an existing (working) test is failing'],
+		'documentation'           => ['D700FF', 'fix the docs'],
+		'question'                => ['D700FF', 'clarify something'],
+		'distribution problem'    => ['D700FF', 'the distributed archive has a problem'],
+		'repository housekeeping' => ['D700FF', 'the repository needs to be updated'],
+		'repository problem'      => ['D700FF', 'the repository has a problem'],
+		'downstream'              => ['D700FF', 'downstream effects'],
+		'release issue'           => ['D700FF', 'something is wrong with a release'],
+		);
+
+	state %platform_labels = (
+		_meta => {
+			prefix => 'Platform',
+			},
+		macos   => ['1d76db', 'improve a feature that already exists'],
+		linux   => ['1d76db', 'add a feature that does not exist'],
+		windows => ['1d76db', 'an existing feature does not work'],
+		other   => ['1d76db', 'an existing test is broken'],
+		);
+
+	state %status_labels = (
+		_meta => {
+			prefix => 'Status',
+			},
+		changes_requested       => ['FF0000', 'adjust the pull request as noted in comments'],
+		needs_details           => ['AFFF00', 'the problem description needs more information'],
+		needs_verification      => ['AFFF00', 'issue needs to be verified'],
+		verified                => ['AFFF00', 'issue has been verified (is reproducible)'],
+		needs_help              => ['00FF00', 'needs outside expertise or capacity'],
+		stalled                 => ['CCCCCC', 'something is blocking progress'],
+		needs_feedback          => ['AFFF00', 'requestor or community feedback needed to go on'],
+		needs_testing           => ['AFFF00', 'the fix needs to be tested'],
+		awaiting_cpan_testers   => ['AFFF00', 'waiting for results from CPAN Testers'],
+		accepted                => ['00FF00', 'the fix is accepted'],
+		fixed                   => ['00FF00', 'the fix has been merged into master'],
+		released                => ['00FF00', 'there is a new release with this fix'],
+		rejected                => ['d7ffd7', 'this change is rejected'],
+		duplicate               => ['CCCCCC', 'this issue is already an issue'],
+		"can't reproduce"       => ['d7ffd7', "the reported behavior has not been seen"],
+		);
+
+
+	state %priority_labels = (
+		_meta => {
+			prefix => 'Priority',
+			},
+		critical        => ['FF0000', 'fix immediately'],
+		high            => ['FF4500', 'work on this first'],
+		low             => ['FFFF00', 'get to this whenever'],
+		backlog         => ['CCCCCC', 'not working on this, unless someone else wants to'],
+		);
+
+	state @label_hashes = ( \%platform_labels, \%type_labels, \%status_labels, \%priority_labels );
+
+	use experimental qw(refaliasing);
+	my @labels;
+	foreach \my %h ( @label_hashes ) {
+		my $meta = $h{_meta};
+		while( my( $name, $tuple ) = each %h ) {
+			next if $name =~ m/\A_/;
+			$name =~ s/_/ /g;
+			push @labels, { name => "$meta->{prefix}: $name", description => $tuple->[1], color => $tuple->[0] };
+			}
+		}
+
+	return \@labels;
+	}
+
+sub _get_labels {
+	my $result = _ghojo()->labels( _github_owner_repo() );
+	if( $result->is_error ) {
+		warn "Error fetching labels\n" . $result->long_summary . "\n";
+		return ();
+		}
+
+	my %hash = map { $_->name, $_ } $result->values->to_array->@*;
+	sort { $a->name cmp $b->name } values %hash;
+	}
+
+sub show_github_labels :Register("show the current GitHub labels") {
+	foreach my $label ( sort { lc($a->name) cmp lc($b->name) } _get_labels() ) {
+		my( $r, $g, $b ) = map { hex($_) } $label->color =~ m/(..)(..)(..)/;
+		say bg_rgb($r, $b, $g ), "   ", reset(), " ", $label->name, " - ", $label->description // '';
+		}
+	}
+
+sub update_github_labels :Register("create the GitHub labels") {
+	state $labels_set = _labels_set();
+	state %labels_to_delete = map { $_ => 1 } (
+		'CPAN Pull Request Challenge',
+		'hacktoberfest',
+		);
+	state %labels_to_translate = (
+		'wontfix'     => "Status: rejected",
+		'help wanted' => 'Status: needs help',
+		'invalid'     => 'Status: rejected',
+		'wishlist'    => 'Type: enhancement',
+		);
+
+	my %counts;
+	foreach my $label ( sort { lc($a->name) cmp lc($b->name) } _get_labels() ) {
+		my $name = $label->name;
+		debug "Looking at existing label <$name>";
+		if( exists $labels_to_delete{ $name } ) {
+			debug "Label <$name> should be deleted";
+			_ghojo()->delete_label( _github_owner_repo(), $name );
+			$counts{'changed'}++;
+			}
+		if( exists $labels_to_translate{ $label->name } ) {
+			debug "Label <$name> should be translated";
+			my $args = { name => $labels_to_translate{ $name }, color => $label->color, description => $label->description };
+			_ghojo()->update_label( _github_owner_repo(), $name, $args );
+			$counts{'translated'}++;
+			}
+		}
+
+	# say dumper($labels_set);
+	my %labels_now = map { $_->{name}, $_ } _get_labels();
+
+	my @errors;
+	foreach my $label_to_set ( $labels_set->@* ) {
+		my $set_name = $label_to_set->{name};
+		my $unprefixed_name = $set_name =~ s/.*:\s+//r;
+
+		my @exists = grep { exists $labels_now{$_} } ( $set_name, $unprefixed_name );
+		my $result = do {
+			if( @exists ) {
+				debug "Label <$exists[0]> exists: update";
+				if( labels_are_the_same( $label_to_set, $labels_now{$exists[0]} ) ) {
+					debug "\tThere is no change for <$exists[0]>";
+					$counts{'skipped'}++
+					}
+				else {
+					_ghojo()->update_label( _github_owner_repo(), $exists[0], $label_to_set );
+					$counts{'updated'}++;
+					}
+				}
+			else {
+				debug "Label <$set_name> does not exist: create";
+				_ghojo()->create_label( _github_owner_repo(), $label_to_set );
+				$counts{'created'}++;
+				}
+			};
+
+		$result = Ghojo::Result->success;
+		say "\t" . do {
+			if( $result->is_success ) {
+				success "Label <$label_to_set->{name}> updated / created";
+				}
+			else {
+				push @errors, $result;
+				error "Problem with <$label_to_set->{name}>";
+				}
+			};
+		}
+
+	debug "There were " . @errors . " errors";
+	debug "Summary: " . dumper(\%counts);
+	return "Labels updated";
+	}
+
+sub labels_are_the_same ( $candidate, $existing ) {
+	state @keys = qw(name description color);
+	if( $existing isa 'Ghojo::Label' ) {
+		$existing = { map { $_, $existing->$_() } @keys };
+		}
+
+	my $first_dump = dumper($candidate) =~ s/^/\t/gmr;
+	my $second_dump = dumper($existing) =~ s/^/\t/gmr;
+
+#	say $first_dump, $second_dump;
+
+	foreach my $key ( @keys ) {
+		return 0 unless $candidate->{$key} eq $existing->{$key}
+		}
+
+	return 1;
+	}
+
+=item * gitignore_template
+
+Download the F<.gitignore> template from github/gitignore
+
+=cut
+
+sub gitignore_template :Register("grab the gitignore template") {
+	state $url = 'https://raw.githubusercontent.com/github/gitignore/main/Perl.gitignore';
+
+	_ua()->get($url)->res->save_to( '.gitignore' );
+
+	"Fetched .gitignore template"
+	}
+
+=item * gitlab
+
+Open the Gitlab main page for this repo.
+
+=cut
+
+sub gitlab :Register("open the main Gitlab page") { _browser( _gitlab_page() ) }
+
+=item * help
+
+Output a list of commands. This is the default command that bmt uses
+when you do not specify a command.
+
+=cut
+
+sub help :Register("show the help message") ( @args ) {
+	my sub colorize ( $command ) {
+		bold() . text_blue() . $_ . reset()
+		};
+
+	my( $longest ) = sort { length $b <=> length $a }
+		map { colorize($_) }
+		keys %Commands;
+	my $length = length $longest; # account for ANSI lengths
+
+	return join "\n", map {
+		sprintf "  %-${length}s     %s", colorize($_), $Commands{$_}->[1]
+		} sort keys %Commands;
+	}
+
+=item * issues
+
+Open the GitHub issues page.
+
+=cut
+
+sub issues :Register("open the Github issues page") { _browser( _github_page( 'issues' ) ) }
+
+=item * licenses
+
+List the licenses for all dependencies.
+
+=cut
+
+sub licenses :Register("list the licenses involved in dependencies") {
+	my @queue = ( [ 0, _dist_name()] );
+	my $mcpan = _metacpan();
+
+	my $Seen = {};
+	my $Licenses = {};
+
+	while( my $next = shift @queue ) {
+		my $licenses = _license_for($next->[1]);
+		say "\t" x $next->[0], $next->[1], ' ', $licenses;
+		$Licenses->{$_}++ for split /\s*,\s*/, $licenses;
+
+		next if $Seen->{ $next->[1] }++;
+
+		unshift @queue,
+			map  { [ $next->[0] + 1, $_ ] }
+			grep { defined }
+			map  { _module_to_dist( $_ ) }
+			grep { ! Module::CoreList::is_core( $_ ) and $_ ne 'perl' }
+			sort
+			map  { $_->{module} }
+			grep { $_->{relationship} eq 'requires' }
+			grep { $_->{phase} eq 'runtime' }
+			map  { $_->@* }
+			eval { $mcpan->release( $next->[1] )->{data}{dependency} } // [];
+		}
+
+	my $string = "License count: " . keys $Licenses->%*;
+	$string .= "Licenses: " .  join " ", sort keys $Licenses->%*;
+
+	return $string;
+	}
+
+=item * metacpan
+
+Open the MetaCPAN page.
+
+=cut
+
+sub metacpan :Register("open the MetaCPAN page")      { _browser( _metacpan_page() ) }
+
+=item * module
+
+Output the name of the main module.
+
+=cut
+
+sub module :Register("output the main module name") { return _main_module() }
+
+=item * modulev
+
+Output the version of the main module.
+
+=cut
+
+sub modulev :Register("output the main module version") {
+	return _version()
+	}
+
+
+=item * new_module MODULE_NAME DESCRIPTION REPO_NAME
+
+Use L<Distritbution::Cooker> to start a new module repository.
+
+The default name of the repo is the lowercased MODULE_NAME with C<::>
+translated to C<->.
+
+After creating the repo, C<new_module> changes into the directory
+and runs C<git init>.
+
+=cut
+
+sub new_module :Register("make a new module directory") ( $module_name, $description = undef, $repo_name = undef ) {
+	$description //= "Undescribed module $module_name";
+	$repo_name   //= lc($module_name) =~ s/::/-/gr;
+
+	state $rc = require Distribution::Cooker;
+	Distribution::Cooker->run( $module_name, $description, $repo_name );
+
+	$Config{path} = catfile( getcwd(), $repo_name );
+	_run_command( 'git', 'init' );
+	_run_git_command( 'add', '.' );
+	_run_git_command( 'commit', '-a', '-m', 'Initial creation with bmt' );
+
+	return "Made $module_name";
+	}
+
+=item * null
+
+Do nothing.
+
+=cut
+
+sub null :Register("do nothing") { return '' }
+
+=item * open_all
+
+Open the Github, Gitlab, Bitbucket, and Appveyor pages all at once.
+
+=cut
+
+sub open_all :Register("open Github, Gitlab, and Bitbucket in one go") ( @args ) {
+	_browser($_) for ( _gitlab_page(), _bitbucket_page(), _github_page(), _appveyor_page() );
+	}
+
+=item * perlv
+
+Show the declared Perl versions in the Perl module files.
+
+=cut
+
+sub perlv :Register("show the declared Perl versions in various files") ( @args ) {
+	state $rc = require Module::Extract::DeclaredMinimumPerl;
+
+	my $minv = _settings()->{MIN_PERL_VERSION};
+
+	_make();
+
+	chomp( my @files = `find blib -name '*.pm'` );
+
+	my %files;
+	my $extor = Module::Extract::DeclaredMinimumPerl->new;
+	foreach my $file ( @files ) {
+		$files{$file} = $extor->get_minimum_declared_perl( $file )
+		}
+
+	my $f_string = join "\n\t", map { "$files{$_} => $_" } sort keys %files;
+
+	return <<~"HERE";
+	Min version: $minv
+	Files:\n\t$f_string
+	HERE
+	}
+
+=item * releases
+
+Show the recent release history.
+
+=cut
+
+sub releases :Register("show the recent release history") ( @args ) {
+	my $string = cpanv() . "\n";
+
+	my $releases = _releases();
+
+	foreach my $release ( $releases->@* ) {
+		state $count = 0;
+		next unless ref $release;
+		last if $count++ > 10;
+		$string .= sprintf "%15s   %-10s  %s\n", cpan_testers($release->[0]), $release->@*;
+		}
+
+	return $string;
+	}
+
+=item * show_config
+
+Show the bmt config.
+
+=cut
+
+sub show_config :Register("show the bmt configuration" ) {
+	return dumper( \%Config );
+	}
+
+=item * show_setup
+
+Show the bmt setup.
+
+=cut
+
+sub show_setup :Register("show what bmt thinks things are" ) {
+	sprintf <<~"HERE", _github_user(), _gitlab_user(), _bitbucket_user();
+		Github user:    %s
+		Gitlab user:    %s
+		Bitbucket user: %s
+		HERE
+	}
+
+=item * start NAME DESCRIPTION
+
+Start a new module with NAME and DESCRIPTION. This is the same
+sequence as:
+
+	new_module
+	create_repos
+
+	push the all remote
+
+=cut
+
+sub start :Register("start a new module, set up git repos, push") ( $name, $description = 'An undescribed module' ) {
+	# make new module directory
+	die "Invalid Perl namespace <$name>!\n" unless _is_valid_package( $name );
+	my $repo_name = lc($name) =~ s/::/-/gr;
+	new_module( $name, $description, $repo_name );
+
+	# create github
+	create_repos( $repo_name, $description );
+
+	# push
+	_run_git_command( 'push', '-u', 'all', 'master' );
+	}
+
+=item * summary
+
+Show a module summary with the different CI results and CPAN Testers
+
+=cut
+
+sub summary :Register("show a module summary") (@args) {
+	my $release_date = _latest_release_date();
+	my $cpan_version = _latest_release_version();
+	my $name         = _main_module();
+
+	my $cpan_testers = cpan_testers();
+
+	my $github   = workflows() =~ s/^/\t/gmr;
+	my $appveyor = appveyor() =~ s/^/\t/gmr;
+
+	return <<~"HERE"
+	[$release_date] $cpan_version $name
+
+	CPAN Testers: $cpan_testers
+
+	GitHub:
+	$github
+	Appveyor:
+	$appveyor
+	HERE
+
+	}
+
+=item * test
+
+Run C<make test>.
+
+=cut
+
+sub test :Register("run the tests") ( @args ) { _make("test") }
+
+=item * update_all
+
+=cut
+
+sub update_all :Register("update many things at once") () {
+	state @actions = qw(
+		update_releaserc
+		update_release_token
+		update_appveyor
+		update_workflows
+		update_github_labels
+		create_cb
+		all_remote
+		update_copyright
+		);
+
+	_combine_actions( @actions );
+
+	'Updated everything';
+	}
+
+=item * update_appveyor
+
+Grab the latest GitHub Actions from L<https://github.com/briandfoy/brians_perl_modules_appveyor_config>.
+
+=cut
+
+sub update_appveyor :Register("update to latest Appveyor config") {
+	my $url  = 'https://raw.githubusercontent.com/briandfoy/brians_perl_modules_appveyor_config/master/perl-appveyor.yml';
+	my $file = '.appveyor.yml';
+
+	say subheader( "Updating Appveyor Config" );
+
+	my( $starting_version ) = map { /(\d+)/ } `grep '^# version' $file`;
+
+	Mojo::UserAgent->new->get( $url )->result->save_to($file);
+
+	my( $latest_version ) = map { /(\d+)/ } `grep '^# version' $file`;
+	if( $starting_version eq $latest_version ) {
+		return "$file is up-to-date already";
+		}
+
+	my $string = "update $file to version $latest_version\n\n$url";
+
+	_run_git_command( 'add', $file );
+	_run_git_command( 'commit', '-m', $string, $file );
+
+	return "Updated $file to version from $starting_version to $latest_version";
+	}
+
+=item * update_bmt
+
+Install the lastest versions of the modules that bmt uses.
+
+=cut
+
+sub update_bmt :Register("update the modules this tool needs") () {
+	my @modules = do {
+		my @found;
+		open my $fh, '<:utf8', __FILE__
+			or die "Could not open " . __FILE__ . ": $!\n";
+		while( <$fh> ) {
+			next unless m/
+				(?-x:require) \s+
+				(?<module>
+					[A-Z][A-Z0-9_]*
+					(?: \:\:[A-Z][A-Z0-9_]* )*
+				)
+				/ix;
+			push @found, $+{module};
+			}
+		sort @found;
+		};
+
+	state $rc = require App::Cpan;
+	App::Cpan->run( @modules );
+	}
+
+=item * update_copyright
+
+=cut
+
+sub update_copyright :Register("update the copyright year to the current year") () {
+	state @directories_to_search = qw(lib script scripts util utils t xt);
+	state %Files_to_skip = map { $_, 1 } qw(LICENSE);
+
+	my $year = (localtime)[5] + 1900;
+
+	my @dirs = grep { -e } @directories_to_search;
+
+	my @files = `grep -l -R Copyright @dirs`;
+	chomp @files;
+
+	my $errors = 0;
+	say subheader( "Processing files");
+	foreach my $file ( @files ) {
+		next if exists $Files_to_skip{ $file };
+
+		my $file = Mojo::File->new($file);
+
+		my $data = decode 'UTF-8', scalar $file->slurp;
+
+		my $rc = $data =~ s/
+			Copyright \s+
+			(?: © | \([cC]\) ) \s+
+			\d{4} \s*
+			- \s*
+			\K
+			\d{4}
+			(?<post>
+			\s* , \s+
+			brian \x{20} d \x{20} foy
+			)
+			/$year$+{post}/x;
+
+		$errors++ unless $rc;
+
+		say "\t", $rc ? success( "$file updated" ) : error( "$file did not match" );
+
+		$file->spew($data, 'UTF-8') if $rc;
+		}
+	print "\n";
+
+	my $message = do {
+		if( @files == $errors )   { error("No files were updated") }
+		elsif( $errors == 0 )     { "All files were updated" }
+		elsif( $errors < @files ) { error("Some files were updated") }
+		};
+
+	return $message;
+	}
+
+=item * update_releaserc
+
+=cut
+
+sub update_releaserc :Register("update the release settings") () {
+	state $cpan_user = $ENV{CPAN_USER} // 'BRIANDFOY';
+	state %defaults = (
+		cpan_user     => $cpan_user,
+		skip_prereqs  => 1,
+		skip_kwalitee => 1,
+		);
+
+	my %from_file = ();
+
+	my @release_files = grep { -e } qw(.releaserc releaserc);
+	@release_files = qw(.releaserc) unless @release_files;
+	my $release_file = $release_files[0];
+
+	if( -e $release_file ) {
+		open my $fh, '<:utf8', $release_file or
+			return "Updating $release_files[0] failed: $!";
+		while( <$fh> ) {
+			chomp;
+			next unless /\S/;
+			my( $name, $value ) = split /\s+/, $_, 2;
+			$from_file{$name} = $value;
+			}
+		}
+
+	my %config = ( %defaults, %from_file );
+	$config{cpan_user} = $cpan_user;
+	my $longest_key = ( sort { length($b) <=> length($a) } keys %config )[0];
+	my $width = length($longest_key);
+
+	open my $fh, '>:utf8', $release_file or
+		return "Could not rewrite $release_file: $!\n";
+	foreach my $key ( sort keys %config ) {
+		next if $key =~ m/\A sf_/x; # ignore sourceforge info
+		printf { $fh } "%-*s %s\n", $width, $key, $config{$key};
+		}
+	close $fh;
+
+	return "Updated $release_file";
+	}
+
+=item * update_release_token
+
+=cut
+
+sub update_release_token :Register("update the GitHub release token secret from RELEASE_ACTION_TOKEN") {
+	state $environment_name = 'release';
+	state $secret_name = 'RELEASE_ACTION_TOKEN';
+
+	my $ghojo = _ghojo();
+
+	unless( exists $ENV{$secret_name} ) {
+		return "Set RELEASE_ACTION_TOKEN and try again\n";
+		}
+
+	my( $owner, $repo ) = _github_owner_repo();
+	debug "update_release_token: owner: $owner repo: $repo";
+	my $env_result = $ghojo->create_environment( $owner, $repo, $environment_name );
+	if( $env_result->is_error ) {
+		say $env_result->short_summary;
+		exit(1);
+		}
+	my $secret_result = $ghojo->create_environment_secret( $owner, $repo, $environment_name, $secret_name, $ENV{$secret_name} );
+	if( $secret_result->is_error ) {
+		say $secret_result->short_summary;
+		exit(1);
+		}
+	}
+
+=item * update_workflows
+
+Grab the latest GitHub Actions from L<https://github.com/briandfoy/github_workflows/>.
+
+=cut
+
+sub update_workflows :Register("update to latest github workflows") {
+	state %file_map = (
+		'linux.yml'   => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-ubuntu.yml',
+		'macos.yml'   => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-macos.yml',
+		'windows.yml' => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-windows.yml',
+		'release.yml' => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-release.yml',
+
+		'perl-module-ubuntu.yml'  => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-ubuntu.yml',
+		'perl-module-macos.yml'   => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-macos.yml',
+		'perl-module-windows.yml' => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-windows.yml',
+		'perl-module-release.yml' => 'https://raw.githubusercontent.com/briandfoy/github_workflows/master/perl-module-release.yml',
+		);
+
+	my $workflow_dir = '.github/workflows';
+	unless( -d $workflow_dir ) {
+		make_path $workflow_dir;
+		foreach my $file ( qw(linux.yml macos.yml windows.yml release.yml) ) {
+			open my $fh, '>', catfile( $workflow_dir, $file ) or warn "Could not open <$file>: $!\n";
+			close $fh;
+			}
+		_run_git_command( 'add', $workflow_dir );
+		}
+
+	my @workflow_files = map {
+		my $file = Mojo::File->new($_);
+		my $contents = $file->slurp;
+		my( $version ) = $contents =~ m/\# version (\S+)/;
+
+		my %h =	(
+			basename => basename($file),
+			filename => $_,
+			current_version  => ( $version // 'no version' ),
+			updated_version => undef,
+			);
+
+		\%h;
+		} glob( "$workflow_dir/*.yml" );
+
+	say subheader( "Fetching latest workflow files" );
+	foreach my $h ( @workflow_files ) {
+		my $basename = $h->{basename};
+		unless( exists $file_map{$basename} ) {
+			warn sprintf "\t<%s> does not have a mapping\n", file($h->{filename});
+			next;
+			}
+
+		printf "\tSelecting <%s> for <%s>\n", url($file_map{$basename} =~ s|\Ahttps://.*?/||r), file($h->{filename});
+
+		Mojo::UserAgent->new->get( $file_map{$basename} )
+			->result->save_to($h->{filename});
+
+		my $file = Mojo::File->new($h->{filename});
+		my $contents = $file->slurp;
+		( $h->{updated_version} ) = $contents =~ m/\# version (\S+)/;
+		}
+
+	print "\n";
+
+	say subheader( "Adjusting versions for Perl minimum version" );
+	adjust_linux_workflow(cron => 1, perl_list => 1);
+	my( $linux_workflow ) = grep { $_->{basename} eq 'linux' } @workflow_files;
+
+	foreach my $h ( @workflow_files ) {
+		my $file = Mojo::File->new($h->{filename});
+		my $contents = $file->slurp;
+		( $h->{updated_version} ) = $contents =~ m/\# version (\S+)/;
+		}
+
+	my $latest_commit = latest_commit( 'briandfoy', 'github_workflows' );
+
+	my $string = "Updated GitHub workflows from https://github.com/briandfoy/github_workflows\n$latest_commit\n\n";
+	$string .= join "\n", map {
+		my $h = $_;
+		sprintf '* %s upgraded: %s -> %s', file($h->{basename}), map { $_ // 'no version' } $h->@{qw(current_version updated_version)}
+		}
+		sort { $a->{basename} cmp $b->{basename} }
+		grep { $_->{current_version} ne ($_->{updated_version} // '') }
+		@workflow_files;
+	$string =~ s/\s+\z//;
+
+	say "\n", subheader( "Committing updates to workflows" );
+	_run_git_command( 'commit', '-m', $string, '.github/workflows' );
+
+	return '';
+	}
+
+sub latest_commit :Register("latest commit") ( $owner = undef, $repo = undef ) {
+	my( $default_owner, $default_repo ) = _github_owner_repo();
+	$owner //= $default_owner;
+	$repo  //= $default_repo;
+
+	my $result = _ghojo()->get_latest_commit( $owner, $repo );
+
+	my( $first ) = $result->values->to_array->@*;
+
+	$first->{sha};
+	}
+
+=item * workflows
+
+Show a summary of the most recent GitHub action workflows.
+
+=cut
+
+sub workflows :Register("show the last set of workflows") ( @args ) {
+	state %colors = (
+		completed   => \&bg_green,
+		cancelled   => sub { bg_rgb(210, 180, 140) },
+		queued      => \&bg_cyan,
+		in_progress => \&bg_yellow,
+		success     => \&bg_green,
+		failure     => \&bg_red,
+		default     => \&bg_cyan,
+		);
+
+	my $result = _ghojo()->list_workflow_runs( _github_owner_repo() );
+	if( $result->is_error ) {
+		die "Error fetching workflows\n" . $result->long_summary . "\n";
+		}
+
+	my $string;
+	foreach my $item ( $result->values->to_array->@* ) {
+		state $id = do {
+			my $id = $item->{head_commit}{id};
+			$string .= "$id\n";
+			$string .= $item->{head_commit}{message} . "\n";
+			$id;
+			};
+		last unless $id eq $item->{head_commit}{id};
+		my( $name, $status, $conclusion ) =
+			map( { $item->{$_} // '' } qw(name status conclusion) );
+
+		my $ex = $status eq 'completed' ? $conclusion : $status;
+		my $color = $colors{$ex} // $colors{'default'};
+
+		$ex = do { no strict 'refs'; $color->() . $ex . reset() };
+
+		$string .= sprintf "%-12s %-12s\n", $name, $ex;
+		}
+
+	return $string;
+	}
+
+=item * version
+
+Show the bmt version.
+
+=cut
+
+sub version :Register("show the bmt version") {
+	return basename($0) . " version " . App::bmt->VERSION . " using Perl " . $^V
+	}
+
+=item * versions
+
+Show the CPAN version and main module version
+
+=cut
+
+sub versions :Register("show the CPAN and main module versions") {
+	state @actions = qw(modulev cpanv);
+	_combine_actions( @actions );
+	"all versions";
+	}
+
+=item * x
+
+=cut
+
+sub x :Register("experimental ever changing target") {
+	my $sha = latest_commit( 'briandfoy', 'github_workflows' );
+	}
+
+=item * zenodo
+
+Open the Zenodo page for this distribution
+
+=cut
+
+sub zenodo :Register("Open the Zenodo page") {
+	return _browser( _zenodo_page() )
+	}
+
+=head2 Mostly internal functions
+
+=over 4
+
+=cut
+
+sub _abstract_from ( $file = _settings()->{ABSTRACT_FROM} ) {
+	open my $fh, '<:encoding(UTF-8)', $file;
+
+	my $abstract;
+
+	while( <$fh> ) { last if /\A=head1 NAME/ }
+	while( <$fh> ) { next unless /\S/; chomp($abstract = $_); last; }
+
+	$abstract;
+	}
+
+sub _appveyor_account ( @args ) {
+	$ENV{APPVEYOR_ACCOUNT} // 'briandfoy';
+	}
+
+sub _appveyor_api_key ( @args ) {
+	$ENV{APPVEYOR_API_KEY};
+	}
+
+sub _appveyor_page ( @args ) {
+	sprintf "https://ci.appveyor.com/project/%s/%s", _github_owner_repo();
+	}
+
+sub _big_json ( $data ) {
+	state $coder = Cpanel::JSON::XS->new->pretty->max_depth;
+	$coder->encode($data);
+	}
+
+
+sub _bitbucket_page ( @args ) {
+	my $url = _git_fetch_url( 'bitbucket' );
+	# git@bitbucket.org:briandfoy/mac-propertylist.git
+	$url =~ s|git\@bitbucket.org:|https://www.bitbucket.org/|;
+	$url;
+	}
+
+=item * _bitbucket_user
+
+Return the Bitbucket account name. It searches for names in this order:
+
+    * The C<BITBUCKET_USER> environment variable
+    * The C<bitbucket_user> key in the config JSON object in F<~/.bmt>
+    * Literally C<briandfoy>
+
+=cut
+
+sub _bitbucket_user { $ENV{BITBUCKET_USER} // _bitbucket_user_from_all() // $Config{bitbucket_user} // 'briandfoy' }
+
+# remote.all.pushurl=git@bitbucket.org:briandfoy/distribution-cooker.git
+sub _bitbucket_user_from_all {
+	my( $line ) = _git_config_list( qr/^remote.all.pushurl=git\@bitbucket.org:/ );
+	my( $user ) = $line =~ qr|git\@bitbucket.org:(.+?)/|;
+	$user;
+	}
+
+=item * _bitbucket_app_password
+
+Return the Bitbucket app password
+
+=cut
+
+sub _bitbucket_app_password { $ENV{BMT_BITBUCKET_APP_PASSWORD} }
+
+=item * _browser( URL )
+
+Open the URL in your browser
+
+=cut
+
+sub _browser :Trace ( $url ) {
+	no strict 'refs';
+	my $handler = "_open_$^O";
+	die "No open handler for $^O" unless defined &{$handler};
+	&{$handler}($url);
+	return '';
+	}
+
+=item * _capture_command( STRING )
+
+Run the string as a command and return the result.
+
+=cut
+
+sub _capture_command ( $command ) {
+	die "This is not a git repo!\n" unless -e '.git';
+	chomp( my $v = `$command` );
+	$v;
+	}
+
+sub _classify ( $key, $data = [] ) {
+	my $results = {};
+	foreach my $item ( $data->@* ) {
+		$results->{ $item->{$key} }++;
+		}
+	$results;
+	}
+
+sub _codeberg_user { $ENV{CODEBERG_USER} // _codeberg_user_from_all() // $Config{codeberg_user} // 'briandfoy' }
+
+# remote.all.pushurl=git@bitbucket.org:briandfoy/distribution-cooker.git
+sub _codeberg_user_from_all {
+	my( $line ) = _git_config_list( qr/^remote.all.pushurl=git\@codeberg.org:/ );
+	my( $user ) = $line =~ qr|git\@codeberg.org:(.+?)/|;
+	$user;
+	}
+
+sub _combine_actions ( @actions ) {
+	foreach my $sub ( @actions ) {
+		my $code = __PACKAGE__->can($sub);
+		unless( ref $code ) {
+			warn "Could not find <$sub>. Skipping...\n";
+			next;
+			}
+
+		say "======== $sub";
+		my $output = $code->();
+		say $output =~ s/^/    /gmr;
+		}
+	}
+
+=item * _recursive_deps
+
+=cut
+
+sub _recursive_deps {
+	my $dist_name = _dist_name();
+
+	my %Grand = ( $dist_name => { level => 0, module => _main_module(), dist => $dist_name, deps => {} } );
+
+	my @queue = ( $Grand{$dist_name} );
+	my %prefetched = ();
+	my %minimum_perls;
+	my %dist_errors;
+
+	my $start_time = [gettimeofday];
+
+	my( $step, $processed ) = ( 0, 0 );
+	while( my $next = shift @queue ) {
+		my( $dist, $deps ) = $next->@{qw(dist deps)};
+		debug "\t" . ++$step . ": Looking at $dist";
+		debug "NEXT: " . Mojo::Util::dumper( $next );
+
+		if( $prefetched{$dist} ) {
+			debug "Already saw $dist so reusing";
+			$deps->%* = $prefetched{$dist}{deps}->%*;
+			next;
+			}
+
+		$next->{sequence} = ++$processed;
+		unless( am_debugging() ) {
+			print '.' unless am_debugging();
+			print " [$processed]\n" unless $processed % 50;
+			}
+
+		my $data = _metacpan()->release($dist);
+
+		my @hashes = map {
+			my $h = {
+				module => $_->{module},
+				deps   => {},
+				level  => $next->{level} + 1,
+				version => $_->{version},
+				dist   => eval { _metacpan()->module( $_->{module} )->{data}{distribution} } // undef,
+				};
+			} $data->{data}{dependency}->@*;
+
+		my( $perl ) = grep { $_->{module} eq 'perl' } @hashes;
+		if( $perl ) {
+			$next->{minimum_perl} = $perl->{version};
+			$minimum_perls{$dist} = $next->{minimum_perl};
+			}
+
+		my $Threshold = $ENV{BMT_RECURSIVE_DEPS_THRESHOLD} // 4;
+		push @queue, grep { $_->{level} <= $Threshold and defined $_->{dist} and ! exists $prefetched{ $_->{dist} } } @hashes;
+		debug "There are now " . @queue . " things in the queue";
+		foreach my $item ( @hashes ) {
+			my $key = 'dist';
+			unless( defined $item->{dist} ) {
+				debug "the hash for module <$item->{module}> did not have an entry for dist";
+				$dist_errors{$item->{module}}++;
+				$key = 'module';
+				}
+			debug sprintf "Adding %s (%s) to deps", $item->{$key}, $key;
+			$deps->{ $item->{dist} } = $item if defined $item->{dist};
+			}
+
+		$prefetched{$dist} = $next;
+		}
+
+	my %big_hash = (
+		meta => {
+			elapsed   => tv_interval($start_time),
+			gm_time   => gmtime(),
+			module    => _main_module(),
+			steps     => $step,
+			processed => $processed,
+			},
+		perls       => \%minimum_perls,
+		deps        => \%prefetched,
+		dist_errors => \%dist_errors,
+		);
+
+	Mojo::File->new('reverse_deps.dump')->spew( Mojo::Util::dumper(\%big_hash) );
+	Mojo::File->new('reverse_deps.json')->spew( _big_json(\%big_hash) );
+	Mojo::File->new('min-perl.json'    )->spew( encode_json(\%minimum_perls) );
+
+	"Done: steps: $step processed: $processed";
+}
+
+=item * _dist_name
+
+Return the dist name, which is the main module name with dashes instead
+of doubled colons.  Module::Release is Module-Release. This is mostly
+true across CPAN, although very few things had other names (L<libwww-perl>
+for example).
+
+=cut
+
+sub _dist_name () { _main_module() =~ s/::/-/gr }
+
+=item * _git_fetch_url( REMOTE_NAME )
+
+Get the fetch URL for the Git remote
+
+=cut
+
+sub _git_fetch_url ( $remote_name ) {
+	my $command = "git config remote.${remote_name}.url";
+	chomp( my $git_url = _capture_command( $command ) );
+	unless( $git_url ) {
+		warn "No $remote_name remote!\n";
+		return;
+		}
+	$git_url;
+	}
+
+=item * _ghojo
+
+Return a L<Ghojo> object
+
+=cut
+
+sub _ghojo () {
+	state $rc = require Ghojo;
+	state $default_file = catfile( $ENV{HOME}, '.github', 'bmt.token' );
+	state $ghojo = do {
+		my %args = do {
+			if( defined $ENV{BMT_GITHUB_TOKEN} ) {
+				( token => $ENV{BMT_GITHUB_TOKEN} );
+				}
+			elsif( defined $ENV{BMT_GITHUB_TOKEN_FILE} and -e $ENV{BMT_GITHUB_TOKEN_FILE} ) {
+				( token_file => $ENV{BMT_GITHUB_TOKEN_FILE} )
+				}
+			elsif( -e $default_file ) {
+				( token_file => $default_file )
+				}
+			};
+		my $ghojo = Ghojo->new( \%args );
+
+		if( $ghojo->is_error ) {
+			say $ghojo->long_summary;
+			exit(10);
+			}
+
+		$ghojo;
+		};
+
+	$ghojo;
+	}
+
+=item * _git_set_push_url( REMOTE, URL )
+
+Add the URL to REMOTE. This command has many pieces!
+
+=cut
+
+sub _git_set_push_url ( $remote, $url ) {
+	debug "Adding $url to $remote remote";
+	_run_git_command( 'remote', 'set-url', '--add', '--push', $remote, $url );
+	}
+
+sub _git_config_list ( $pattern = qr/./ ) {
+	my @matching =
+		grep { /$pattern/ }
+		split /\R/,
+		_capture_command( 'git config --list' );
+	}
+
+=item * _github_owner_repo
+
+Return the owner and repo name for this Github clone.
+
+=cut
+
+sub _github_owner_repo () {
+	my $url = _settings()->{META_MERGE}{resources}{repository}{url};
+	if( $url =~ /\.git\z/ ) {
+		warn "URL ends in .git! Adjusting $url\n";
+		$url =~ s/\.git\z//;
+		}
+	die "No URL! Stopping!\n" unless $url;
+	my( $owner, $repo ) = $url =~ m|https://github.com/(\S+?)/(\S+)(\.git)?|;
+	}
+
+sub _github_page ( $path = '',  @args ) {
+	_settings()->{META_MERGE}{resources}{repository}{web} . "/$path";
+	}
+
+=item * _github_user
+
+Return the GitHub account name. It searches for names in this order:
+
+    * The C<GITHUB_USER> environment variable
+    * The GitHub account from the repo URL in the C<all> remote in F<.git/config>
+    * The C<github_user> key in the config JSON object in F<~/.bmt>
+    * Literally C<briandfoy>
+
+=cut
+
+sub _github_user { $ENV{GITHUB_USER} // _github_user_from_all() // $Config{github_user} // 'briandfoy' }
+
+# remote.all.pushurl=git@github.com:briandfoy/distribution-cooker.git
+sub _github_user_from_all {
+	my( $line ) = _git_config_list( qr/^remote.all.pushurl=git\@github.com:/ );
+	my( $user ) = $line =~ qr|git\@github.com:(.+?)/|;
+	$user;
+	}
+
+sub _gitlab_page ( @args ) {
+	my $url = _git_fetch_url( 'gitlab' );
+	# git@gitlab.com:briandfoy/mac-propertylist.git
+	$url =~ s|git\@gitlab.com:|https://www.gitlab.com/|;
+	$url;
+	}
+
+=item * _gitlab_user
+
+Return the Gitlab account name. It searches for names in this order:
+
+    * The C<GITLAB_USER> environment variable
+    * The Gitlab account from the repo URL in the C<all> remote in F<.git/config>
+    * The C<gitlab_user> key in the config JSON object in F<~/.bmt>
+    * Literally C<briandfoy>
+
+=cut
+
+sub _gitlab_user { $ENV{GITLAB_USER} // _gitlab_user_from_all() // $Config{gitlab_user} // 'briandfoy' }
+
+# remote.all.pushurl=git@gitlab.com:briandfoy/distribution-cooker.git
+sub _gitlab_user_from_all {
+	my( $line ) = _git_config_list( qr/^remote.all.pushurl=git\@gitlab.com:/ );
+	my( $user ) = $line =~ qr|git\@gitlab.com:(.+?)/|;
+	$user;
+	}
+
+=item * _is_valid_package( STRING )
+
+Returns true if STRING is a valid Perl namespace, and false otherwise.
+
+=cut
+
+sub _is_valid_package ( $package ) {
+	return 1 if $package =~ m/ \A [A-Z][A-Z0-9_]* (:: [A-Z][A-Z0-9_]* )* \z /xi;
+	return 0;
+	}
+
+=item * _latest_release
+
+=cut
+
+sub _latest_release {
+	my @releases =
+		map { my @p = split; $p[-1] =~ s/.*release-//; \@p }
+		`git for-each-ref --format='%(committerdate:short) %(refname)' refs/tags`;
+	return {} unless @releases;
+	my %hash;
+	@hash{ qw( date version ) } = $releases[-1]->@*;
+	\%hash;
+	}
+
+=item * _latest_release_version
+
+Return the latest release date, in YYYY-MM-DD
+
+=cut
+
+sub _latest_release_date { _latest_release()->{date} }
+
+=item * _latest_release_version
+
+Return the latest release version
+
+=cut
+
+sub _latest_release_version { _latest_release()->{version} }
+
+sub _license_for ( $dist ) {
+	state $Seen;
+	return $Seen->{$dist} if exists $Seen->{$dist};
+	$Seen->{$dist} = join ', ', _metacpan()->release($dist)->{data}{license}->@*;
+	}
+
+sub _line_from ( $file ) {
+	open my $fh, '<:encoding(UTF-8)', $file;
+	chomp( my $line = <$fh> );
+	say "LINE: $_";
+	return $line;
+	}
+
+=item * _main_module
+
+Return the name of the main module
+
+=cut
+
+sub _main_module () { _settings()->{NAME} }
+
+=item * _make( TARGETS )
+
+Re-run F<Makefile.PL> and run C<make> with the specified TARGETS.
+
+=cut
+
+sub _make ( @targets ) {
+	`$^X Makefile.PL 2>&1`;
+	`make @targets`;
+	}
+
+=item * _metacpan
+
+Get a L<MetaCPAN::Client> object
+
+=cut
+
+=begin ignore
+
+{
+"reporter":"\"Slaven Rezi&#x107;\" <srezic@cpan.org>",
+"grade":"pass",
+"osname":"linux",
+"perl":"5.30.2",
+"osvers":"5.4.0-33-generic",
+"date":"2021-02-26T16:21:00Z",
+"version":"2.127_04",
+"guid":"a9a736ec-784e-11eb-841d-be631f24ea8f",
+"dist":"Module-Release",
+"platform":"x86_64-linux"
+}
+
+=end ignore
+
+=cut
+
+sub _metacpan () {
+	state $rc = require MetaCPAN::Client;
+	state $mcpan = MetaCPAN::Client->new;
+	$mcpan;
+	}
+
+=item * _metacpan_page
+
+Return the MetaCPAN page for this module
+
+=cut
+
+sub _metacpan_page () {
+	"https://metacpan.org/pod/" . _settings()->{NAME}
+	}
+
+sub _module_to_dist ( $module ) {
+	state $mcpan = _metacpan();
+	state $cache = {};
+	return $cache->{$module} if exists $cache->{$module};
+	$cache->{$module} = eval { $mcpan->module( $module )->{data}{distribution} };
+	}
+
+=item * _open_darwin
+
+Open a URL in Safari
+
+=cut
+
+sub _open_darwin :Trace ( $url ) { system 'open', '-a', 'Safari', $url }
+
+=item _orc_id
+
+=cut
+
+sub _orc_id {
+	state $filename = catfile( $ENV{HOME}, '.orc_id' );
+	say "FILE: $filename";
+	_line_from($filename);
+	}
+
+=item * _releases
+
+=cut
+
+sub _releases {
+	open my $fh, '<:utf8', 'Changes' or die "Could not open Changes!: $!\n";
+
+	my @releases;
+	while( <$fh> ) {
+		state $count = 0;
+		next unless m/\A\d/;
+		trim($_);
+		push @releases, [ split ];
+		}
+
+	\@releases;
+	}
+
+=item * _remote_exists( REMOTE )
+
+Returns true if there's a remote with name REMOTE
+
+	_remote_exists( 'origin' );
+
+=cut
+
+sub _remote_exists ( $remote ) {
+	chomp( my @remotes = split /\R/, _capture_command( "git remote" ) );
+	my $found = grep { $_ eq $remote } @remotes;
+	return $found;
+	}
+
+=item * _repo_exists( URL )
+
+Returns true if the git URL is actually a repo.
+
+	_repo_exists( 'git@github.com:briandfoy/ghojo.git' );
+
+=cut
+
+sub _repo_exists ( $url ) {
+	my $output = _capture_command( "git ls-remote $url 2>&1" );
+	$output =~ m/\A[a-h0-9]{40}\s+HEAD\R/;
+	}
+
+=item * _run_command( LIST )
+
+Run LIST as a C<system> command.
+
+=cut
+
+sub _run_command ( @command ) {
+	print command( join ' ', map { ( /\s/ ? qq("$_") : $_ ) =~ s/\n/\x{2424}/gr } @command );
+	print text_orange();
+	system { $command[0] } @command;
+	print reset();
+	print "\n";
+	}
+
+=item * _run_git_command( LIST )
+
+Run LIST as a C<system> command. If there is no F<.git> directory,
+this dies.
+
+=cut
+
+sub _run_git_command ( @command ) {
+	die "This is not a git repo!\n" unless -e '.git';
+	unshift @command, 'git' unless $command[0] eq 'git';
+	_run_command( @command );
+	}
+
+=item * _settings
+
+Get the C<WriteMakefileArgs> from F<Makefile.PL>.
+
+=cut
+
+sub _settings {
+	state $package = eval { require "./Makefile.PL" };
+	die "Could not load Makefile.PL: $@\n" unless $package;
+	die "Makefile.PL doesn't seem to have retuned a package name! <$package>\n"
+		unless _is_valid_package($package);
+	state $settings = $package->arguments;
+	$settings;
+	}
+
+=item * _ua
+
+Returns a Mojo::UserAgent object.
+
+=cut
+
+sub _ua {
+	state $rc = require Mojo::UserAgent;
+	state $ua = Mojo::UserAgent->new;
+	$ua
+	}
+
+=item * _version
+
+=cut
+
+sub _version {
+	state $rc = require Module::Extract::VERSION;
+	my $version_from = _settings()->{VERSION_FROM};
+
+	my $version = Module::Extract::VERSION->parse_version_safely( $version_from );
+	}
+
+=itme * _zenodo_page
+
+Construct the Zenodo page URL from the repo owner and name
+
+=cut
+
+sub _zenodo_page {
+	# https://zenodo.org/account/settings/github/repository/briandfoy/mac-propertylist
+
+	my $url_template = 'https://zenodo.org/account/settings/github/repository/%s/%s';
+
+	sprintf $url_template, _github_owner_repo();
+	}
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright © 2019-2024 brian d foy. All rights reserved.
+
+=head1 LICENSE
+
+You can use this code under the terms of the Artistic Licence 2.0.
+
+=cut
+
+__END__
+my %WriteMakefile = (
+	'MIN_PERL_VERSION' => '5.008',
+
+	'NAME'          => $module,
+	'ABSTRACT_FROM' => $main_file,
+	'VERSION_FROM'  => $main_file,
+	'AUTHOR'        => 'brian d foy <bdfoy@cpan.org>',
+	'LICENSE'       => 'artistic_2',
+
+	'CONFIGURE_REQUIRES' => {
+		'ExtUtils::MakeMaker'   => '6.64',
+		'File::Spec::Functions' => '0',
+		},
+
+	'BUILD_REQUIRES' => {
+		},
+
+	'TEST_REQUIRES' => {
+		'Test::Data' => '0',
+		'Test::More' => '1',
+		},
+
+	'PREREQ_PM'     => {
+		},
+
+	'PL_FILES'      => {
+		'preprocess/Object/Iterate.pm.PL' => 'blib/lib/Object/Iterate.pm',
+		},
+
+	'META_MERGE' => {
+		'meta-spec' => { version => 2 },
+		resources => {
+			repository => {
+				type => 'git',
+				url  => "$github.git",
+				web  => $github,
+				},
+			bugtracker => {
+				web    => "$github/issues",
+				},
+			homepage => $github,
+			},
+		},
+
+	clean => { FILES => "$dist-*" },
+	);
