@@ -18,6 +18,66 @@ use constant CROSS     => bold . text_red   . "\x{274C}" . reset;
 use constant COLUMNS   => (GetTerminalSize)[0];
 use constant ROWS      => (GetTerminalSize)[1];
 
+=encoding utf8
+
+=head1 NAME
+
+make_perl_symlinks - create version-labeled symlinks to perl tools
+
+=head1 SYNOPSIS
+
+	% make_perl_symlinks
+
+=head1 DESCRIPTION
+
+I have many Perl installations, all under F</usr/local/perls>, such as F</usr/local/perls/perl-5.40.0>.
+Instead of putting all of those in my C<PATH>, I make symlinks under F<$ENV{HOME}/bin/perls> so
+I can use a particular version of a tool by the short name, such as F<perl5.40.3> of F<cpan5.40.3>.
+
+	$ ls -l /Users/brian/bin/perls | grep 5.40.3
+	lrwxrwxr-x@ 1 brian  staff  41 Sep  2 18:24 corelist5.40.3 -> /usr/local/perls/perl-5.40.3/bin/corelist
+	lrwxrwxr-x@ 1 brian  staff  37 Sep  2 18:24 cpan5.40.3 -> /usr/local/perls/perl-5.40.3/bin/cpan
+	lrwxrwxr-x@ 1 brian  staff  39 Sep  2 18:24 enc2xs5.40.3 -> /usr/local/perls/perl-5.40.3/bin/enc2xs
+	...
+	lrwxrwxr-x@ 1 brian  staff  37 Sep  2 18:24 perl5.40.3 -> /usr/local/perls/perl-5.40.3/bin/perl
+	...
+
+I also make links such as F<perl-latest> to point to whatever version is the
+highest version I have installed:
+
+	$ ls -l /Users/brian/bin/perls | grep latest
+	lrwxrwxr-x@ 1 brian  staff  43 Sep  2 19:37 cpan-audit-latest -> /usr/local/perls/perl-5.42.0/bin/cpan-audit
+	lrwxrwxr-x@ 1 brian  staff  37 Sep  2 19:37 cpan-latest -> /usr/local/perls/perl-5.42.0/bin/cpan
+	lrwxrwxr-x@ 1 brian  staff  44 Sep  2 19:37 cpan-upload-latest -> /usr/local/perls/perl-5.42.0/bin/cpan-upload
+	...
+	lrwxrwxr-x@ 1 brian  staff  43 Sep  2 19:37 perl-latest -> /usr/local/perls/perl-5.42.0/bin/perl5.42.0
+	lrwxrwxr-x@ 1 brian  staff  47 Sep  2 19:37 perl-reversion-latest -> /usr/local/perls/perl-5.42.0/bin/perl-reversion
+	lrwxrwxr-x@ 1 brian  staff  40 Sep  2 19:37 perlbug-latest -> /usr/local/perls/perl-5.42.0/bin/perlbug
+	lrwxrwxr-x@ 1 brian  staff  40 Sep  2 19:37 perldoc-latest -> /usr/local/perls/perl-5.42.0/bin/perldoc
+	...
+
+=head1 TO DO
+
+=head1 SEE ALSO
+
+=head1 SOURCE AVAILABILITY
+
+This source is in Github:
+
+	http://github.com/briandfoy/app-make_perl_symlinks
+
+=head1 AUTHOR
+
+brian d foy, C<< <briandfoy@pobox.com> >>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright © 2025, brian d foy, All Rights Reserved.
+
+You may redistribute this under the terms of the Artistic License 2.0.
+
+=cut
+
 sub am_debugging () { !! $ENV{'DEBUG'} }
 sub debug    ($message) { _message( "[debug] $message" ) }
 unless( am_debugging ) { no warnings qw(redefine); *debug = sub { 1 } }
@@ -174,7 +234,3 @@ sub progress_overwrite ($message) {
 	_message( '  ' .             $message . $separator, [bold, text_green] );
 	}
 
-__END__
-my $latest_name = '/Users/brian/bin/perls/perl-latest';
-unlink $latest_name;
-symlink $latest->[2], $latest_name or warn $!;
