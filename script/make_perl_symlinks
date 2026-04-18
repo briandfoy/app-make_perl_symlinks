@@ -56,9 +56,6 @@ highest version I have installed:
 	lrwxrwxr-x@ 1 brian  staff  40 Sep  2 19:37 perldoc-latest -> /usr/local/perls/perl-5.42.0/bin/perldoc
 	...
 
-=head1 TO DO
-
-=head1 SEE ALSO
 
 =head1 SOURCE AVAILABILITY
 
@@ -127,6 +124,23 @@ sub cleanup_dead_symlinks ( $dir ) {
 
 	}
 
+sub cleanup_source_dir ( $dir ) {
+	my( $version ) = $dir =~ m{/perl-(.+?)(?:/|$)};
+	my $perl  = catfile( $dir, 'bin', 'perl' );
+	my $vperl = $perl . $version;
+
+	my @tuples = [ $perl, $vperl ];
+	push @tuples, [ reverse $tuples[0]->@* ];
+
+	foreach my $t ( @tuples ) {
+		next unless( -e $t->[0] and !(-e $t->[1]) );
+		debug( "Symlinking <$t->[0]> to <$t->[1]>" );
+		symlink $t->[0], $t->[1];
+		}
+
+	$vperl;
+	}
+
 sub dumper { state $rc = require Data::Dumper; Data::Dumper->new([@_])->Indent(1)->Sortkeys(1)->Terse(1)->Useqq(1)->Dump }
 
 sub get_perl_directories ( $base = '/usr/local/perls' ) {
@@ -158,44 +172,23 @@ sub get_perl_version ($path) {
 		};
 	}
 
-sub cleanup_source_dir ( $dir ) {
-	my( $version ) = $dir =~ m{/perl-(.+?)(?:/|$)};
-	my $perl  = catfile( $dir, 'bin', 'perl' );
-	my $vperl = $perl . $version;
-
-	my @tuples = [ $perl, $vperl ];
-	push @tuples, [ reverse $tuples[0]->@* ];
-
-	foreach my $t ( @tuples ) {
-		next unless( -e $t->[0] and !(-e $t->[1]) );
-		debug( "Symlinking <$t->[0]> to <$t->[1]>" );
-		symlink $t->[0], $t->[1];
-		}
-
-	$vperl;
-	}
-
 sub make_links ( $perl_path, $version_string, $links_dir = $links_directory ) {
 	my @bins = glob( catfile( dirname($perl_path), '*' ) );
 
 	my $count = 0;
 	foreach my $bin ( @bins ) {
 		debug( "\tlooking at $bin" );
-		my $link_basename = do {
-			my $basename = basename( $bin );
-			if( $basename =~ m/5\.\d+\.\d+\z/) { $basename }
-			else                               { "$basename$version_string" }
-			};
+		my $link_basename = basename( $bin );
+		my $versioned_basename = "$link_basename$version_string";
 
-		my $link = catfile( $links_directory, $link_basename );
-		next if( -l $link and $bin eq readlink $link );
-		$count++;
-		progress_overwrite( sprintf "%s linking %s", '   ', $bin );
+		my $link         = catfile( $links_directory, $link_basename );
+		my $version_link = catfile( $links_directory, $versioned_basename );
 
-		unless( -e $link ) {
-			symlink $bin => $link or
-				problem( "  Could not create bin symlink [$!]: $bin => $link!" );
-			}
+		progress_overwrite( sprintf "%s linking %s", '   ', $link );
+		symlink $bin => $link;
+
+		progress_overwrite( sprintf "%s linking %s", '   ', $version_link );
+		symlink $bin => $version_link;
 		}
 
 	return $count;
